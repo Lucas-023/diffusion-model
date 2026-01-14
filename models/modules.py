@@ -9,16 +9,16 @@ class DoubleConv(nn.Module):
             nn.GroupNorm(num_groups=32, num_channels=out_channels),
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(out_channels),
+            nn.GroupNorm(num_groups=32, num_channels=out_channels),
             nn.GELU()
         )
 
     def forward(self, x):
         return self.double_conv(x)
     
-class downsample(nn.Module):
+class down(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=256):
-        super(downsample, self).__init__()
+        super(down, self).__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
             DoubleConv(in_channels, out_channels)
@@ -34,7 +34,7 @@ class downsample(nn.Module):
         emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
         return x + emb
 
-class Up(nn.Module):
+class up(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=256):
         super().__init__()
 
