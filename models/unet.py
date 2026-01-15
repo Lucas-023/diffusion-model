@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from modules import DoubleConv, up, down, attention_block
+from models.modules import DoubleConv, up, down, attention_block
 
 class unet(nn.Module):
     def __init__(self, in_Ch=3, out_ch = 3, time_dim = 256, device="cuda"):
