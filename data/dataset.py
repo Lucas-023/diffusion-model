@@ -10,34 +10,40 @@ def normalize_to_neg_one_to_one(t):
     return (t * 2) - 1
 
 def get_data(args):
-    """
-    Carrega o dataset CIFAR-10 de forma compatível com Windows/Linux.
-    """
-    transforms = T.Compose([
-        T.Resize(args.image_size),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        # Referência à função global em vez de lambda local
-        T.Lambda(normalize_to_neg_one_to_one) 
+    transforms = torchvision.transforms.Compose([
+        torchvision.transforms.Resize(args.image_size),
+        torchvision.transforms.RandomResizedCrop(args.image_size, scale=(0.8, 1.0)),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-
-    dataset = torchvision.datasets.CIFAR10(
-        root=args.dataset_path, 
-        train=True, 
+    
+    # ===== MUDE AQUI =====
+    
+    # Carrega treino (50k)
+    dataset_train = torchvision.datasets.CIFAR10(
+        root="./cifar10_data", 
+        train=True,  
         download=True, 
         transform=transforms
     )
-
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        # No Windows, workers > 0 exige que a função seja "pickleable" (global)
-        num_workers=4,      
-        pin_memory=True,    
-        drop_last=True
+    
+    # Carrega teste (10k)
+    dataset_test = torchvision.datasets.CIFAR10(
+        root="./cifar10_data", 
+        train=False,  # ← Importante!
+        download=True, 
+        transform=transforms
     )
-
+    
+    # Concatena os dois (60k total)
+    from torch.utils.data import ConcatDataset
+    dataset = ConcatDataset([dataset_train, dataset_test])
+    
+    print(f"✅ Dataset completo: {len(dataset)} imagens (train + test)")
+    
+    # =====================
+    
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     return dataloader
 
 # --- Bloco de Teste ---
