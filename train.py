@@ -17,8 +17,19 @@ def train(args):
     # 1. Configuração Inicial e Diretórios
     setup_logging(args.run_name)
     device = args.device
+    print("\n" + "="*60)
+    print("🔍 DEBUG: Verificando dataset no treino")
+    print("="*60)
+    # =========================
+    
     dataloader = get_data(args)
     
+    # ===== ADICIONE AQUI =====
+    print(f"📊 Total de batches no dataloader: {len(dataloader)}")
+    print(f"📊 Tamanho do dataset: {len(dataloader.dataset):,}")
+    print(f"📊 Batch size: {args.batch_size}")
+    print(f"📊 Cálculo: {len(dataloader.dataset)} / {args.batch_size} = {len(dataloader.dataset)/args.batch_size:.2f}")
+    print("="*60 + "\n")    
     # Define caminhos universais (independente do PC)
     save_dir = os.path.join("models", args.run_name)
     results_dir = os.path.join("results", args.run_name)
@@ -40,7 +51,7 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     
     # Scheduler
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    #scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
     mse = nn.MSELoss()
     diffusion = Diffusion(img_size=args.image_size, device=device)
@@ -70,8 +81,8 @@ def train(args):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         # Restaura Scheduler
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        #if 'scheduler_state_dict' in checkpoint:
+           #scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
         # Define a próxima época
         start_epoch = checkpoint['epoch'] + 1
@@ -128,7 +139,7 @@ def train(args):
         print(f"\n📊 Época {epoch} - Loss Médio: {avg_loss:.6f} | Último Batch: {last_batch_loss:.6f}")
         
         # Atualiza o Scheduler
-        scheduler.step()
+        #scheduler.step()
 
         # Salva o Checkpoint Completo
         checkpoint = {
@@ -136,7 +147,7 @@ def train(args):
             "model_state_dict": model.state_dict(),
             "ema_state_dict": ema_model.state_dict(),  # ✅ Salva EMA
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
+            #"scheduler_state_dict": scheduler.state_dict(),
             "loss": avg_loss,  # ✅ Salva loss médio, não último batch
             "last_batch_loss": last_batch_loss,  # Info adicional
         }
@@ -160,11 +171,11 @@ def main():
     
     # Hyperparâmetros
     parser.add_argument('--run_name', type=str, default="DDPM_CIFAR10", help="Nome da pasta do run")  
-    parser.add_argument('--epochs', type=int, default=500, help="Total de épocas")
-    parser.add_argument('--batch_size', type=int, default=12, help="Batch size") 
-    parser.add_argument('--image_size', type=int, default=64, help="Resolução da imagem") 
+    parser.add_argument('--epochs', type=int, default=700, help="Total de épocas")
+    parser.add_argument('--batch_size', type=int, default=128, help="Batch size") 
+    parser.add_argument('--image_size', type=int, default=32, help="Resolução da imagem") 
     parser.add_argument('--device', type=str, default="cuda", help="cuda ou cpu")
-    parser.add_argument('--lr', type=float, default=3e-4, help="Learning Rate Inicial")
+    parser.add_argument('--lr', type=float, default=2e-4, help="Learning Rate Inicial")
     
     args = parser.parse_args()
     
