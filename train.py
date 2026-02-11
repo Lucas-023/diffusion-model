@@ -10,7 +10,7 @@ from copy import deepcopy
 
 # Importando seus módulos
 from utils.utils import get_data, save_images, setup_logging
-from models.unet import unet
+from models.unet import UNet
 from diffusion.ddpm import Diffusion
 
 def train(args):
@@ -40,7 +40,7 @@ def train(args):
     ckpt_path = os.path.join(save_dir, "ckpt.pt")
 
     # 2. Instanciação do Modelo Principal e EMA
-    model = unet().to(device)
+    model = UNet().to(device)
     
     # ✅ EMA: Cria versão suavizada do modelo
     ema_model = deepcopy(model)
@@ -171,7 +171,7 @@ def main():
     
     # Hyperparâmetros
     parser.add_argument('--run_name', type=str, default="DDPM_CIFAR10", help="Nome da pasta do run")  
-    parser.add_argument('--epochs', type=int, default=700, help="Total de épocas")
+    parser.add_argument('--epochs', type=int, default=1700, help="Total de épocas")
     parser.add_argument('--batch_size', type=int, default=128, help="Batch size") 
     parser.add_argument('--image_size', type=int, default=32, help="Resolução da imagem") 
     parser.add_argument('--device', type=str, default="cuda", help="cuda ou cpu")

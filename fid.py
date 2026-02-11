@@ -3,8 +3,8 @@ FID Score Calculator para DDPM
 Calcula o Fréchet Inception Distance entre imagens geradas e dataset real
 
 Uso:
-    python calculate_fid.py --checkpoint models/DDPM_CIFAR10/ckpt_epoch_100.pt
-    python calculate_fid.py --checkpoint models/DDPM_CIFAR10/ckpt.pt --num_samples 5000
+    python calculate_fid.py --checkpoint models/DDPM_CIFAR10/ckpt_epoch_1699.pt
+    python calculate_fid.py --checkpoint models/DDPM_CIFAR10/ckpt.pt --num_samples 50000
 """
 
 import torch
@@ -312,9 +312,9 @@ def main():
                        help='Caminho do checkpoint (.pt)')
     parser.add_argument('--num_samples', type=int, default=10000,
                        help='Número de amostras para calcular FID (padrão: 10000)')
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--batch_size', type=int, default=128,
                        help='Batch size para geração (padrão: 64)')
-    parser.add_argument('--image_size', type=int, default=64,
+    parser.add_argument('--image_size', type=int, default=32,
                        help='Tamanho da imagem (padrão: 64)')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device (cuda ou cpu)')
