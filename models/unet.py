@@ -2,160 +2,156 @@ import torch
 import torch.nn as nn
 import math
 
-from models.modules import ResidualBlock, Upsample, Downsample, AttentionBlock, SinusoidalPosEmb # Importe a nova classe
+from models.modules import ResidualBlock, Upsample, Downsample, AttentionBlock, SinusoidalPosEmb, SiLU # Importe a nova classe
 
 class UNet(nn.Module):
-    """
-    UNet do paper DDPM
-    
-    Configuração padrão para CIFAR-10 (32×32):
-    - base_channels: 128
-    - channel_mult: [1, 2, 2, 2]
-    - num_res_blocks: 2
-    - attention_resolutions: [16]
-    - dropout: 0.1
-    """
     def __init__(
         self,
         in_channels=3,
         out_channels=3,
         base_channels=128,
-        channel_mult=(1, 2, 2, 2),
-        num_res_blocks=2,
-        attention_resolutions=(16,),
+        channel_mults=(1, 2, 2, 2),
         dropout=0.1,
+        attention_resolutions=(16,),
+        num_res_blocks=2, 
+        image_size=32 # Used to determine when to add attention
     ):
         super().__init__()
-        
-        self.in_channels = in_channels
-        self.base_channels = base_channels
-        self.channel_mult = channel_mult
-        self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
-        
-        # Time embedding
-        time_emb_dim = base_channels * 4
+
+        # 1. Time Embedding MLP
+        # Dimension is usually 4 * base_channels
+        time_dim = base_channels * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(base_channels),
-            nn.Linear(base_channels, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(base_channels, time_dim),
+            SiLU(),
+            nn.Linear(time_dim, time_dim),
         )
-        
-        # Input projection
+
+        # 2. Initial Convolution
         self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+
+        # 3. Encoder (Downsampling Path)
+        self.downs = nn.ModuleList()
+        curr_channels = base_channels
         
-        # Encoder
-        self.down_blocks = nn.ModuleList()
-        ch = base_channels
-        input_block_chans = [ch]
+        # To handle skip connections later
+        self.down_block_channels = [curr_channels] 
+
+        resolution = image_size
         
-        # Resoluções: 32 → 16 → 8 → 4
-        resolutions = [32, 16, 8, 4]
-        
-        for level, mult in enumerate(channel_mult):
-            out_ch = base_channels * mult
+        for level, mult in enumerate(channel_mults):
+            out_channels_level = base_channels * mult
             
+            # Add Residual Blocks for this level
             for _ in range(num_res_blocks):
-                layers = [ResidualBlock(ch, out_ch, time_emb_dim, dropout)]
-                ch = out_ch
+                layers = [ResidualBlock(curr_channels, out_channels_level, time_dim, dropout)]
+                curr_channels = out_channels_level
                 
-                # Add attention se resolução correta
-                if resolutions[level] in attention_resolutions:
-                    layers.append(AttentionBlock(ch))
+                # Add Attention if at correct resolution
+                if resolution in attention_resolutions:
+                    layers.append(AttentionBlock(curr_channels))
                 
-                self.down_blocks.append(nn.ModuleList(layers))
-                input_block_chans.append(ch)
-            
-            # Downsample (exceto último nível)
-            if level != len(channel_mult) - 1:
-                self.down_blocks.append(nn.ModuleList([Downsample(ch)]))
-                input_block_chans.append(ch)
-        
-        # Bottleneck (meio da UNet)
-        self.middle_block = nn.ModuleList([
-            ResidualBlock(ch, ch, time_emb_dim, dropout),
-            AttentionBlock(ch),
-            ResidualBlock(ch, ch, time_emb_dim, dropout),
+                self.downs.append(nn.ModuleList(layers))
+                self.down_block_channels.append(curr_channels)
+
+            # Add Downsample (except at the last level)
+            if level != len(channel_mults) - 1:
+                self.downs.append(nn.ModuleList([Downsample(curr_channels)]))
+                self.down_block_channels.append(curr_channels)
+                resolution //= 2
+
+        # 4. Bottleneck (Middle Block)
+        # Always: ResBlock -> Attention -> ResBlock
+        self.mid = nn.ModuleList([
+            ResidualBlock(curr_channels, curr_channels, time_dim, dropout),
+            AttentionBlock(curr_channels),
+            ResidualBlock(curr_channels, curr_channels, time_dim, dropout),
         ])
+
+        # 5. Decoder (Upsampling Path)
+        self.ups = nn.ModuleList()
         
-        # Decoder
-        self.up_blocks = nn.ModuleList()
-        
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            out_ch = base_channels * mult
+        # Iterate in reverse for upsampling
+        for level, mult in reversed(list(enumerate(channel_mults))):
+            out_channels_level = base_channels * mult
             
-            for i in range(num_res_blocks + 1):
-                # Skip connection channels
-                skip_ch = input_block_chans.pop()
-                layers = [ResidualBlock(ch + skip_ch, out_ch, time_emb_dim, dropout)]
-                ch = out_ch
+            # In decoder, we have num_res_blocks + 1 blocks per level
+            # (standard U-Net mirroring)
+            for _ in range(num_res_blocks + 1):
+                # Concatenate with skip connection
+                skip_channels = self.down_block_channels.pop()
+                layers = [ResidualBlock(curr_channels + skip_channels, out_channels_level, time_dim, dropout)]
+                curr_channels = out_channels_level
                 
-                # Add attention se resolução correta
-                if resolutions[level] in attention_resolutions:
-                    layers.append(AttentionBlock(ch))
+                # Add Attention if at correct resolution
+                if resolution in attention_resolutions:
+                    layers.append(AttentionBlock(curr_channels))
                 
-                self.up_blocks.append(nn.ModuleList(layers))
+                self.ups.append(nn.ModuleList(layers))
             
-            # Upsample (exceto primeiro nível do decoder = último do encoder)
+            # Add Upsample (except at the first level / last step of decoder)
             if level != 0:
-                self.up_blocks.append(nn.ModuleList([Upsample(ch)]))
+                self.ups.append(nn.ModuleList([Upsample(curr_channels)]))
+                resolution *= 2
+
+        # 6. Final Output Block
+        self.out_norm = nn.GroupNorm(32, curr_channels)
+        self.out_act = SiLU()
+        self.out_conv = nn.Conv2d(curr_channels, out_channels, 3, padding=1)
+
+    def forward(self, x, t):
+        # 1. Time Embedding
+        t = self.time_mlp(t)
         
-        # Output
-        self.conv_out = nn.Sequential(
-            nn.GroupNorm(32, ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, out_channels, 3, padding=1),
-        )
-    
-    def forward(self, x, time):
-        """
-        Args:
-            x: [B, 3, 32, 32] - Imagem com ruído
-            time: [B] - Timesteps
-        Returns:
-            [B, 3, 32, 32] - Ruído predito
-        """
-        # Time embedding
-        t = self.time_mlp(time)
-        
-        # Input
+        # 2. Initial Conv
         h = self.conv_in(x)
         
-        # Encoder (com skip connections)
-        hs = [h]
-        for layers in self.down_blocks:
-            for layer in layers:
+        # Store skip connections
+        skips = [h]
+
+        # 3. Encoder
+        for layer_group in self.downs:
+            for layer in layer_group:
                 if isinstance(layer, ResidualBlock):
                     h = layer(h, t)
-                elif isinstance(layer, AttentionBlock):
+                else:
                     h = layer(h)
-                elif isinstance(layer, Downsample):
-                    h = layer(h)
-            hs.append(h)
-        
-        # Bottleneck
-        for layer in self.middle_block:
+            skips.append(h)
+
+        # 4. Bottleneck
+        for layer in self.mid:
             if isinstance(layer, ResidualBlock):
                 h = layer(h, t)
             else:
                 h = layer(h)
-        
-        # Decoder (com skip connections)
-        for layers in self.up_blocks:
-            for layer in layers:
-                if isinstance(layer, ResidualBlock):
-                    # Concatena skip connection
-                    h = torch.cat([h, hs.pop()], dim=1)
-                    h = layer(h, t)
-                elif isinstance(layer, AttentionBlock):
-                    h = layer(h)
-                elif isinstance(layer, Upsample):
-                    h = layer(h)
-        
-        # Output
-        return self.conv_out(h)
 
+        # 5. Decoder
+        for layer_group in self.ups:
+            # We need to distinguish between normal layers and upsampling
+            # But since Upsample is wrapped in a list, we iterate normally.
+            # The catch is the ResidualBlock needs the skip connection.
+            
+            # Check if this group contains an Upsample layer (which takes no skip)
+            is_upsample_group = isinstance(layer_group[0], Upsample)
+            
+            if is_upsample_group:
+                h = layer_group[0](h)
+            else:
+                # It's a ResBlock group. Pop skip connection.
+                skip = skips.pop()
+                h = torch.cat((h, skip), dim=1)
+                
+                for layer in layer_group:
+                    if isinstance(layer, ResidualBlock):
+                        h = layer(h, t)
+                    else:
+                        h = layer(h)
+        
+        # 6. Final Output
+        h = self.out_norm(h)
+        h = self.out_act(h)
+        return self.out_conv(h)
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -166,7 +162,7 @@ if __name__ == "__main__":
         in_channels=3,
         out_channels=3,
         base_channels=128,
-        channel_mult=(1, 2, 2, 2),
+        channel_mults=(1, 2, 2, 2),
         num_res_blocks=2,
         attention_resolutions=(16,),
         dropout=0.1,

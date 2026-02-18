@@ -3,19 +3,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class ResidualBlock(nn.Module):  
-    def __init__(self, in_channels, out_channels, time_emb_dim=256, dropout=0.1):
+class SiLU(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.GroupNorm(32, in_channels)
-        self.act = nn.SiLU()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-
-
-        self.time_mlp =  nn.Linear(time_emb_dim, out_channels)
         
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.act1 = SiLU()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+
+        # Time Embedding Projection
+        self.time_emb = nn.Linear(time_emb_dim, out_channels)
+        self.time_act = SiLU()
 
         self.norm2 = nn.GroupNorm(32, out_channels)
-        self.dropout = nn.Dropout(dropout)         
+        self.act2 = SiLU()
+        self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
 
         if in_channels != out_channels:
@@ -23,22 +30,22 @@ class ResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-
     def forward(self, x, t):
         h = self.norm1(x)
-        h = self.act(h)
+        h = self.act1(h)
         h = self.conv1(h)
 
-        time_emb = self.time_mlp(t)[:, :, None, None]
-        h = h + time_emb
+        t_vec = self.time_act(t)
+        t_vec = self.time_emb(t_vec)[:, :, None, None]
+        h = h + t_vec
 
         h = self.norm2(h)
-        h = self.act(h)
+        h = self.act2(h)
         h = self.dropout(h)
         h = self.conv2(h)
 
         return h + self.shortcut(x)
-
+    
 class Downsample(nn.Module):
     """Downsampling com conv strided (igual paper)"""
     def __init__(self, channels):
