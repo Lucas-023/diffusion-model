@@ -47,8 +47,8 @@ class Diffusion:
         with torch.no_grad():
             x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
             
-            # Loop reverso
-            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
+            # MUDA AQUI: De range(1, ...) para range(0, ...)
+            for i in tqdm(reversed(range(0, self.noise_steps)), position=0):
                 t = (torch.ones(n) * i).long().to(self.device)
                 
                 predicted_noise = model(x, t)
@@ -58,24 +58,17 @@ class Diffusion:
                 alpha_hat = self.alpha_hat[t][:, None, None, None]
                 beta = self.beta[t][:, None, None, None]
                 
-                if i > 1:
+                # MUDA AQUI: De i > 1 para i > 0
+                if i > 0:
                     noise = torch.randn_like(x)
                 else:
                     noise = torch.zeros_like(x)
                 
                 # FÓRMULA CORRETA:
-                # x = 1 / sqrt(alpha) * (x - ((1-alpha)/(sqrt(1-alpha_hat))) * eps) + sigma * z
                 x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
         
         model.train()
-        
-        # --- DEBUG: Tire o comentário abaixo se ainda der branco ---
-        # print(f"DEBUG Sample: Min {x.min()} Max {x.max()} Mean {x.mean()}")
-        
-        # O resultado sai daqui como float entre [-1, 1] aprox.
-        # A conversão para imagem é feita no save_images do utils.py
-        return x
-    
+        return x    
 if __name__ == "__main__":
     # Teste rápido para ver se a matemática não quebra
     device = "cuda" if torch.cuda.is_available() else "cpu"
