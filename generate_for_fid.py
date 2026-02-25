@@ -4,7 +4,7 @@ import argparse
 from tqdm import tqdm
 from torchvision.utils import save_image
 
-# Suas importações
+# Ajuste as importações conforme a estrutura do seu projeto
 from models.unet import UNet
 from diffusion.ddpm import Diffusion
 
@@ -12,7 +12,7 @@ def generate_images(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Iniciando geração no dispositivo: {device}")
 
-    # 1. Configura as Pastas
+    # 1. Configura a Pasta de Saída
     output_dir = os.path.join("fid_samples", args.run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -27,7 +27,6 @@ def generate_images(args):
     
     checkpoint = torch.load(ckpt_path, map_location=device)
     
-    # Carrega os pesos do EMA (crucial para bater a qualidade do paper)
     if 'ema_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['ema_state_dict'])
         print("✅ Pesos do modelo EMA carregados com sucesso!")
@@ -37,41 +36,50 @@ def generate_images(args):
     
     model.eval()
 
-    # 4. Loop de Geração em Batches
+    # 4. Loop de Geração Inteligente
+    images_left = args.num_images
     total_generated = 0
-    batches = args.num_images // args.batch_size
-    remainder = args.num_images % args.batch_size
 
-    print(f"Gerando {args.num_images} imagens usando DDPM padrão (1000 passos)...")
-    print(f"Isso vai demorar. Pegue um café! ☕\n")
-
+    print(f"\nGerando um total de {args.num_images} imagens...")
+    
     with torch.no_grad():
-        for i in tqdm(range(batches)):
-            # Usando a função sample original (DDPM)
-            sampled_images = diffusion.sample(model, n=args.batch_size)
-            
-            # Salva cada imagem do batch individualmente
-            for j in range(args.batch_size):
-                img_idx = total_generated + j
-                save_image(sampled_images[j], os.path.join(output_dir, f"img_{img_idx:05d}.png"))
-            
-            total_generated += args.batch_size
+        with tqdm(total=args.num_images, desc="Gerando") as pbar:
+            while images_left > 0:
+                # Garante que o último batch não gere imagens a mais
+                current_batch_size = min(args.batch_size, images_left)
 
-        # Gera o restinho se a divisão não for exata
-        if remainder > 0:
-            sampled_images = diffusion.sample(model, n=remainder)
-            for j in range(remainder):
-                img_idx = total_generated + j
-                save_image(sampled_images[j], os.path.join(output_dir, f"img_{img_idx:05d}.png"))
+                # ==============================================================
+                # 🔄 ESCOLHA O MÉTODO DE GERAÇÃO (Comente/Descomente aqui)
+                # ==============================================================
 
-    print(f"\n🎉 Geração concluída! Imagens salvas em: {output_dir}")
+                # --- OPÇÃO 1: DDPM (Artigo Original, 1000 passos, Lento) ---
+                # sampled_images = diffusion.sample(model, n=current_batch_size)
+                # # Correção obrigatória: desnormaliza de [-1, 1] para [0, 1]
+                # sampled_images = (sampled_images.clamp(-1, 1) + 1) / 2.0 
+                
+                # --- OPÇÃO 2: DDIM (Rápido, 50 passos) ---
+                sampled_images = diffusion.sample_ddim(model, n=current_batch_size, ddim_timesteps=50, ddim_eta=0.0)
+                # Nota: Não precisa de correção aqui, pois nosso sample_ddim já devolve [0, 1]!
+
+                # ==============================================================
+
+                # Salva cada imagem do batch individualmente
+                for j in range(current_batch_size):
+                    img_idx = total_generated + j
+                    save_image(sampled_images[j], os.path.join(output_dir, f"img_{img_idx:05d}.png"))
+                
+                total_generated += current_batch_size
+                images_left -= current_batch_size
+                pbar.update(current_batch_size)
+
+    print(f"\n🎉 Geração concluída! {total_generated} imagens salvas em: {output_dir}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_name', type=str, required=True, help="Nome da pasta do modelo treinado")
-    parser.add_argument('--image_size', type=int, default=32, help="Tamanho da imagem (32 para CIFAR-10)")
+    parser.add_argument('--image_size', type=int, default=32, help="Tamanho da imagem")
     parser.add_argument('--batch_size', type=int, default=128, help="Imagens geradas por vez na GPU")
-    parser.add_argument('--num_images', type=int, default=10000, help="Total de imagens para gerar (Paper usou 50000)")
+    parser.add_argument('--num_images', type=int, default=50000, help="Total de imagens para gerar")
     args = parser.parse_args()
     
     generate_images(args)
