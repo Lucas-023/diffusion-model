@@ -6,7 +6,7 @@ import logging
 from tqdm import tqdm
 import argparse
 from copy import deepcopy
-from torch.cuda.amp import GradScaler, autocast # <--- IMPORT AMP
+from torch.cuda.amp import GradScaler, autocast 
 
 from utils.utils import get_data, save_images, setup_logging
 from models.unet import UNet
@@ -46,7 +46,6 @@ def train(args):
         if 'ema_state_dict' in checkpoint:
             ema_model.load_state_dict(checkpoint['ema_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        # Load scaler state if you saved it (optional, but good practice)
         if 'scaler_state_dict' in checkpoint:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
@@ -64,24 +63,19 @@ def train(args):
             
             optimizer.zero_grad()
 
-            # 3. Mixed Precision Training Context
             with autocast():
                 x_t, noise = diffusion.noise_images(images, t)
                 predicted_noise = model(x_t, t)
                 loss = mse(noise, predicted_noise)
 
-            # 4. Scale Loss & Backward
             scaler.scale(loss).backward()
             
-            # Unscale before clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # Step with scaler
             scaler.step(optimizer)
             scaler.update()
             
-            # EMA Update (standard)
             with torch.no_grad():
                 for ema_param, param in zip(ema_model.parameters(), model.parameters()):
                     ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
@@ -97,7 +91,7 @@ def train(args):
             "model_state_dict": model.state_dict(),
             "ema_state_dict": ema_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(), # Save scaler state
+            "scaler_state_dict": scaler.state_dict(), 
             "loss": avg_loss,
         }
         torch.save(checkpoint, ckpt_path)
@@ -120,4 +114,5 @@ def main():
     train(args)
 
 if __name__ == '__main__':
+
     main()
