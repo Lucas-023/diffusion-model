@@ -4,11 +4,23 @@ import torch.nn.functional as F
 import math
 
 class SiLU(nn.Module):
+    #definindo a função de ativação
     def forward(self, x):
         return x * torch.sigmoid(x)
 
 
 class ResidualBlock(nn.Module):
+    """
+    Bloco residual
+
+    Estrutura:
+    - Normalização (GroupNorm) + ativação (SiLU) + convolução 3x3.
+    - Injeção da embedding temporal (time embedding) após a primeira convolução,
+      permitindo que o bloco seja condicionado ao passo de tempo t.
+    - Segunda sequência de normalização + ativação + dropout + convolução 3x3.
+    - Conexão residual (skip connection) somando a entrada original à saída,
+      com projeção 1x1 caso o número de canais mude.
+    """
     def __init__(self, in_channels, out_channels, time_emb_dim, dropout=0.1):
         super().__init__()
         
@@ -16,7 +28,6 @@ class ResidualBlock(nn.Module):
         self.act1 = SiLU()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
-        # Time Embedding Projection
         self.time_emb = nn.Linear(time_emb_dim, out_channels)
         self.time_act = SiLU()
 
@@ -47,7 +58,7 @@ class ResidualBlock(nn.Module):
         return h + self.shortcut(x)
     
 class Downsample(nn.Module):
-    """Downsampling com conv strided (igual paper)"""
+    #definindo downsampling com conv strided
     def __init__(self, channels):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
@@ -57,7 +68,7 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    """Upsampling com interpolação + conv (igual paper)"""
+    #definindo upsampling com interpolação + conv
     def __init__(self, channels):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, 3, padding=1)
@@ -68,7 +79,7 @@ class Upsample(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Self-attention (QKV attention)"""
+    #definindo self attention
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
@@ -98,12 +109,10 @@ class AttentionBlock(nn.Module):
         out = self.proj_out(out)
         return x + out
 
-# Em modules.py
 
-import math # Não esqueça de importar math
 
 class SinusoidalPosEmb(nn.Module):
-    """Positional encoding para timestep (igual paper)"""
+    #definindo positional encoding para timestep
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
