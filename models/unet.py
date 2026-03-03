@@ -14,12 +14,12 @@ class UNet(nn.Module):
         dropout=0.1,
         attention_resolutions=(16,),
         num_res_blocks=2, 
-        image_size=32 # Used to determine when to add attention
+        image_size=32 #usado para determinar onde aplicar o bloco de self attention
     ):
         super().__init__()
 
-        # 1. Time Embedding MLP
-        # Dimension is usually 4 * base_channels
+        
+        #deinindo mlp para o tempo
         time_dim = base_channels * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(base_channels),
@@ -28,14 +28,13 @@ class UNet(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
-        # 2. Initial Convolution
+        #convolução inicial
         self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
-        # 3. Encoder (Downsampling Path)
+        #encoder
         self.downs = nn.ModuleList()
         curr_channels = base_channels
         
-        # To handle skip connections later
         self.down_block_channels = [curr_channels] 
 
         resolution = image_size
@@ -43,74 +42,70 @@ class UNet(nn.Module):
         for level, mult in enumerate(channel_mults):
             out_channels_level = base_channels * mult
             
-            # Add Residual Blocks for this level
+            #adiciona os blocos resiudais para esse nível
             for _ in range(num_res_blocks):
                 layers = [ResidualBlock(curr_channels, out_channels_level, time_dim, dropout)]
                 curr_channels = out_channels_level
                 
-                # Add Attention if at correct resolution
+                #confere se deve adicionar atenção e adiciona se for o caso
                 if resolution in attention_resolutions:
                     layers.append(AttentionBlock(curr_channels))
                 
                 self.downs.append(nn.ModuleList(layers))
                 self.down_block_channels.append(curr_channels)
 
-            # Add Downsample (except at the last level)
+            #caso não seja o último nível adiciona o downsample
             if level != len(channel_mults) - 1:
                 self.downs.append(nn.ModuleList([Downsample(curr_channels)]))
                 self.down_block_channels.append(curr_channels)
                 resolution //= 2
 
-        # 4. Bottleneck (Middle Block)
-        # Always: ResBlock -> Attention -> ResBlock
+        #bottleneck
+        #ResBlock -> Attention -> ResBlock
         self.mid = nn.ModuleList([
             ResidualBlock(curr_channels, curr_channels, time_dim, dropout),
             AttentionBlock(curr_channels),
             ResidualBlock(curr_channels, curr_channels, time_dim, dropout),
         ])
 
-        # 5. Decoder (Upsampling Path)
+        #decoder
         self.ups = nn.ModuleList()
         
-        # Iterate in reverse for upsampling
+        #itera ao contrário para o upsampling
         for level, mult in reversed(list(enumerate(channel_mults))):
             out_channels_level = base_channels * mult
             
-            # In decoder, we have num_res_blocks + 1 blocks per level
-            # (standard U-Net mirroring)
+            #no decoder temos num_res_blocks + 1 blocos resiudais por nível
+            #espelhamento padrão da unet
             for _ in range(num_res_blocks + 1):
-                # Concatenate with skip connection
+
                 skip_channels = self.down_block_channels.pop()
                 layers = [ResidualBlock(curr_channels + skip_channels, out_channels_level, time_dim, dropout)]
                 curr_channels = out_channels_level
                 
-                # Add Attention if at correct resolution
+                #adiciona atenção se estiver na resolução correto
                 if resolution in attention_resolutions:
                     layers.append(AttentionBlock(curr_channels))
                 
                 self.ups.append(nn.ModuleList(layers))
             
-            # Add Upsample (except at the first level / last step of decoder)
+            #adiciona upsample se não estiver no ultimo nível
             if level != 0:
                 self.ups.append(nn.ModuleList([Upsample(curr_channels)]))
                 resolution *= 2
 
-        # 6. Final Output Block
+        #output
         self.out_norm = nn.GroupNorm(32, curr_channels)
         self.out_act = SiLU()
         self.out_conv = nn.Conv2d(curr_channels, out_channels, 3, padding=1)
 
     def forward(self, x, t):
-        # 1. Time Embedding
         t = self.time_mlp(t)
         
-        # 2. Initial Conv
         h = self.conv_in(x)
         
-        # Store skip connections
         skips = [h]
 
-        # 3. Encoder
         for layer_group in self.downs:
             for layer in layer_group:
                 if isinstance(layer, ResidualBlock):
@@ -119,26 +114,18 @@ class UNet(nn.Module):
                     h = layer(h)
             skips.append(h)
 
-        # 4. Bottleneck
         for layer in self.mid:
             if isinstance(layer, ResidualBlock):
                 h = layer(h, t)
             else:
                 h = layer(h)
 
-        # 5. Decoder
         for layer_group in self.ups:
-            # We need to distinguish between normal layers and upsampling
-            # But since Upsample is wrapped in a list, we iterate normally.
-            # The catch is the ResidualBlock needs the skip connection.
-            
-            # Check if this group contains an Upsample layer (which takes no skip)
             is_upsample_group = isinstance(layer_group[0], Upsample)
             
             if is_upsample_group:
                 h = layer_group[0](h)
             else:
-                # It's a ResBlock group. Pop skip connection.
                 skip = skips.pop()
                 h = torch.cat((h, skip), dim=1)
                 
@@ -148,7 +135,7 @@ class UNet(nn.Module):
                     else:
                         h = layer(h)
         
-        # 6. Final Output
+        #output
         h = self.out_norm(h)
         h = self.out_act(h)
         return self.out_conv(h)
