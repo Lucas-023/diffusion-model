@@ -17,7 +17,6 @@ def train(args):
     device = args.device
     dataloader = get_data(args)
     
-    # 1. Enable cuDNN Benchmark (Huge speedup for fixed size images)
     torch.backends.cudnn.benchmark = True 
     
     save_dir = os.path.join("models", args.run_name)

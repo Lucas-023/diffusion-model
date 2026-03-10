@@ -39,7 +39,7 @@ class Diffusion:
         return torch.randint(1, self.noise_steps, size=(n,))
     
     def sample(self, model, n):
-        #faznedo sample de n imagens
+        #fazendo sample de n imagens
         logging.info(f"Sampling {n} new images....")
         model.eval()
         with torch.no_grad():

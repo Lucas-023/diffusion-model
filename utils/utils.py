@@ -36,9 +36,9 @@ def get_data(args):
         dataset_full, 
         batch_size=args.batch_size, 
         shuffle=True,
-        num_workers=4,      # Keep at 4 (or try 8 if you have a strong CPU)
-        pin_memory=True,    # Crucial for GPU
-        persistent_workers=True # <--- NEW: Keeps workers alive between epochs
+        num_workers=4,      
+        pin_memory=True,    
+        persistent_workers=True 
     )
     
     return dataloader
