@@ -8,7 +8,36 @@ class SiLU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
 
+def normalization(channels):
+    return nn.GroupNorm(32, channels)
 
+def conv_nd(dims, *args, **kwargs):
+    if dims == 1: return nn.Conv1d(*args, **kwargs)
+    elif dims == 2: return nn.Conv2d(*args, **kwargs)
+    raise ValueError(f"unsupported dims: {dims}")
+
+def zero_module(module):
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+class QKVAttentionLegacy(nn.Module):
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        bs, width, length = qkv.shape
+        ch = width // (3 * self.n_heads)
+        # Divide por heads PRIMEIRO, depois separa Q K V
+        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        # Scale aplicado em Q *e* K separados (mais estável em f16)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v)
+        return a.reshape(bs, -1, length)
+    
 class ResidualBlock(nn.Module):
     """
     Bloco residual
@@ -78,37 +107,68 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 
+class QKVAttention(nn.Module):
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        bs, width, length = qkv.shape
+        ch = width // (3 * self.n_heads)
+        # Separa Q K V PRIMEIRO, depois aplica as heads via .view()
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(bs * self.n_heads, ch, length),
+            (k * scale).view(bs * self.n_heads, ch, length),
+        )
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        return a.reshape(bs, -1, length)
+    
+from torch.utils.checkpoint import checkpoint as th_checkpoint
+
 class AttentionBlock(nn.Module):
-    #definindo self attention
-    def __init__(self, channels):
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,   # NOVO: alternativa para definir heads por canais
+        use_checkpoint=False,   # NOVO: economiza memória no backward
+        use_new_attention_order=False,  # NOVO: escolhe qual QKVAttention usar
+    ):
         super().__init__()
         self.channels = channels
-        
-        self.norm = nn.GroupNorm(32, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, 1)
-        self.proj_out = nn.Conv2d(channels, channels, 1)
-    
-    def forward(self, x):
-        B, C, H, W = x.shape
-        
-        h = self.norm(x)
-        
-        qkv = self.qkv(h)
-        q, k, v = torch.chunk(qkv, 3, dim=1)
-        
-        q = q.reshape(B, C, H * W).permute(0, 2, 1)  # [B, HW, C]
-        k = k.reshape(B, C, H * W)                    # [B, C, HW]
-        v = v.reshape(B, C, H * W).permute(0, 2, 1)  # [B, HW, C]
-        
-        attn = torch.bmm(q, k) / math.sqrt(C)
-        attn = F.softmax(attn, dim=-1)
-        
-        out = torch.bmm(attn, v)
-        out = out.permute(0, 2, 1).reshape(B, C, H, W)
-        
-        out = self.proj_out(out)
-        return x + out
+        self.use_checkpoint = use_checkpoint
 
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert channels % num_head_channels == 0
+            self.num_heads = channels // num_head_channels  # ex: 512ch / 64 = 8 heads
+
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+
+        if use_new_attention_order:
+            self.attention = QKVAttention(self.num_heads)
+        else:
+            self.attention = QKVAttentionLegacy(self.num_heads)
+
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x):
+        # checkpoint() re-computa o forward no backward em vez de guardar os ativations
+        return th_checkpoint(self._forward, x, use_reentrant=False) if self.use_checkpoint else self._forward(x)
+
+    def _forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
 
 class SinusoidalPosEmb(nn.Module):
