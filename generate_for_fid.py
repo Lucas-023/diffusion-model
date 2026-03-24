@@ -46,12 +46,12 @@ def generate_images(args):
 
 
                 #DDPM 
-                # sampled_images = diffusion.sample(model, n=current_batch_size)
+                sampled_images = diffusion.sample(model, n=current_batch_size)
                 # # Correção obrigatória: desnormaliza de [-1, 1] para [0, 1]
-                # sampled_images = (sampled_images.clamp(-1, 1) + 1) / 2.0 
+                sampled_images = (sampled_images.clamp(-1, 1) + 1) / 2.0 
                 
                 #DDIM
-                sampled_images = diffusion.sample_ddim(model, n=current_batch_size, ddim_timesteps=50, ddim_eta=0.0)
+                #sampled_images = diffusion.sample_ddim(model, n=current_batch_size, ddim_timesteps=50, ddim_eta=0.0)
 
                 #salva cada imagem do batch individualmente
                 for j in range(current_batch_size):
