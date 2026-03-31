@@ -7,4 +7,5 @@ conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvi
 pip install tqdm matplotlib pillow types-python-dateutil
 
 ddpm with 32x32 images:
-🎉 FID Score: 7.15
+🎉 FID Score: 3.35
+
