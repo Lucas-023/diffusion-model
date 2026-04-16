@@ -158,11 +158,8 @@ class AttentionBlock(nn.Module):
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
-    def forward(self, x):
-        # checkpoint() re-computa o forward no backward em vez de guardar os ativations
-        return th_checkpoint(self._forward, x, use_reentrant=False) if self.use_checkpoint else self._forward(x)
 
-    def _forward(self, x):
+    def forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
@@ -185,3 +182,63 @@ class SinusoidalPosEmb(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
         return embeddings
+    
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channels,
+        cond_dim,
+        num_heads=8,
+        num_head_channels=32,
+        use_new_attention_order=True,
+    ):
+        super().__init__()
+
+        self.channels = channels
+
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert channels % num_head_channels == 0
+            self.num_heads = channels // num_head_channels
+
+        self.norm = normalization(channels)
+
+        # diferença principal:
+        self.to_q = conv_nd(1, channels, channels, 1)
+        self.to_kv = conv_nd(1, cond_dim, channels * 2, 1)
+
+        if use_new_attention_order:
+            self.attention = QKVAttention(self.num_heads)
+        else:
+            self.attention = QKVAttentionLegacy(self.num_heads)
+
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+
+    def forward(self, x, cond):
+        b, c, *spatial = x.shape
+
+        # flatten x
+        x_in = x
+        x = x.reshape(b, c, -1)
+        x = self.norm(x)
+
+        # flatten cond
+        cond = cond.reshape(b, cond.shape[1], -1)
+
+        # Q vem de x
+        q = self.to_q(x)
+
+        # K,V vêm do cond
+        kv = self.to_kv(cond)
+        k, v = kv.chunk(2, dim=1)
+
+        # concat no formato esperado pelo QKVAttention
+        qkv = torch.cat([q, k, v], dim=1)
+
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+
+        return (x_in.reshape(b, c, -1) + h).reshape(b, c, *spatial)

@@ -1,6 +1,8 @@
-*.pt
-*.jpg
-*.png
-*.gz
-*.html
-*.pyc
+# ignora tudo
+*
+
+# permite pastas
+!*/
+
+# permite arquivos python
+!*.py
