@@ -3,8 +3,8 @@ import torch.nn as nn
 from tqdm import tqdm 
 import logging
 import numpy as np
-import math
-class Diffusion:
+
+class Diffusion_conditional:
     def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=32, device="cuda"):
         self.noise_steps = noise_steps
         self.beta_start = beta_start
@@ -12,33 +12,21 @@ class Diffusion:
         self.img_size = img_size
         self.device = device
         
-        #definimos o beta (taxa de destruição da imagem)
+        # definimos o beta (taxa de destruição da imagem)
         self.beta = self.prepare_noise_schedule().to(device)
         
-        #definimos o alpha(quanto da imagem original sobra)
+        # definimos o alpha(quanto da imagem original sobra)
         self.alpha = 1. - self.beta
         
-        #alpha hat (alpha_cumprod) é o acumulado até o passo t
-        #serve para irmos diretamente ao passo t sem passar por todos os anteriores
+        # alpha hat (alpha_cumprod) é o acumulado até o passo t
+        # serve para irmos diretamente ao passo t sem passar por todos os anteriores
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 
     def prepare_noise_schedule(self):
-        s = 0.008 
-        steps = self.noise_steps + 1
-        
-        x = torch.linspace(0, self.noise_steps, steps)
-        
-        alphas_cumprod = torch.cos(((x / self.noise_steps) + s) / (1 + s) * math.pi * 0.5) ** 2
-        
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0] 
-        
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        
-        # Clipamos os valores para evitar divisões por zero ou instabilidades numéricas
-        return torch.clip(betas, 0.0001, 0.9999)
+        return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
     
     def noise_images(self, x, t):
-        #colocando ruído na imagem        
+        # colocando ruído na imagem        
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         
@@ -47,20 +35,26 @@ class Diffusion:
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
     
     def sample_timesteps(self, n):
-        #sorteando o t
+        # sorteando o t
         return torch.randint(1, self.noise_steps, size=(n,))
     
-    def sample(self, model, n):
-        #fazendo sample de n imagens
+    # --- MUDANÇA 1: Adicionado 'context' e 'channels' ---
+    def sample(self, model, n, context=None, channels=4):
+        # fazendo sample de n imagens
         logging.info(f"Sampling {n} new images....")
         model.eval()
         with torch.no_grad():
-            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+            # --- MUDANÇA 2: Usando a variável 'channels' em vez do 3 fixo ---
+            x = torch.randn((n, channels, self.img_size, self.img_size)).to(self.device)
             
             for i in tqdm(reversed(range(0, self.noise_steps)), position=0):
                 t = (torch.ones(n) * i).long().to(self.device)
                 
-                predicted_noise = model(x, t)
+                # --- MUDANÇA 3: Roteamento condicional vs incondicional ---
+                if context is not None:
+                    predicted_noise = model(x, t, context=context)
+                else:
+                    predicted_noise = model(x, t)
                 
                 # Coeficientes
                 alpha = self.alpha[t][:, None, None, None]
@@ -76,16 +70,18 @@ class Diffusion:
         
         model.train()
         return x    
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    diff = Diffusion(device=device)
+    # Lembre-se: Para 256x256 com VAE f=8, o img_size aqui deve ser 32
+    diff = Diffusion(img_size=32, device=device) 
     
-    fake_img = torch.randn(2, 3, 64, 64).to(device)
+    # Teste no espaço latente (4 canais)
+    fake_latent = torch.randn(2, 4, 32, 32).to(device)
     t = diff.sample_timesteps(2).to(device)
     
-    noisy_img, noise = diff.noise_images(fake_img, t)
+    noisy_latent, noise = diff.noise_images(fake_latent, t)
     
-    print("Gerenciador de Difusão criado com sucesso!")
-    print(f"Shape da imagem ruidosa: {noisy_img.shape}")
-    print(f"Shape do ruído isolado: {noise.shape}")
-
+    print("✅ Gerenciador de Difusão criado com sucesso!")
+    print(f"✅ Shape do latente ruidoso: {noisy_latent.shape}")
+    print(f"✅ Shape do ruído isolado: {noise.shape}")
