@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Suas importações
-from utils.utils import get_data, save_images, setup_logging
+from utils.utils_celeba import get_data, save_images, setup_logging
 from models.unet import UNet
 from diffusion.ddpm import Diffusion
 

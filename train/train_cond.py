@@ -10,13 +10,13 @@ from torch.cuda.amp import GradScaler, autocast
 from torchvision.utils import make_grid 
 
 from board import Board
-from utils.utils import get_data, save_images, setup_logging
+from utils.utils_celeba import get_data, save_images, setup_logging
 from diffusion.conditional_ddpm import Diffusion_conditional
 
 # --- NOVOS IMPORTS ---
 from models.unet_conditional import UNet_cond
 from models.modules import LatentConditionProjector
-from models.vae import VAE # Assumindo que guardou a sua VAE aqui
+from vae.modules import VAE # Assumindo que guardou a sua VAE aqui
 
 def train(args):
     setup_logging(args.run_name)

@@ -1,40 +1,51 @@
 import torch
 import torchvision
+import torchvision.transforms as T
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler # <-- Importante para Multi-GPU
 
-def get_data(args):
-    # Transformação ideal para rostos: Corta o centro (evitando fundo) e redimensiona
-    transforms = torchvision.transforms.Compose([
-        torchvision.transforms.CenterCrop(178),  # Corta o retângulo original (178x218) para quadrado
-        torchvision.transforms.Resize(args.image_size), # Sobe para 256x256
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # Deixa no range [-1, 1]
+def get_data(args, is_distributed=False):
+    transforms = T.Compose([
+        T.CenterCrop(178),
+        # 2. Redimensiona para o tamanho desejado (usando TUPLA!)
+        T.Resize((args.image_size, args.image_size)),
+        # 3. Espelhamento
+        T.RandomHorizontalFlip(p=0.5),
+        # 4. Transforma em Tensor (0 a 1)
+        T.ToTensor(),
+        # 5. Normaliza para (-1 a 1)
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    # Usando ImageFolder no lugar de CelebA
-    # O caminho aponta para a pasta PAI da pasta que contém as imagens
-    dataset = torchvision.datasets.ImageFolder(
-        root=args.dataset_path, 
+    # ⚠️ Aviso: download=True no CelebA costuma falhar por cota do Google Drive.
+    dataset = torchvision.datasets.CelebA(
+        root="./CelebA_data", 
+        split='all',  
+        download=True, 
         transform=transforms
     )
     
-    print(f"✅ Dataset carregado: {len(dataset)} imagens")
+    print(f"✅ Dataset completo: {len(dataset)} imagens")
     
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    return dataloader
+    if is_distributed:
+        sampler = DistributedSampler(dataset)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False)
+        return dataloader, sampler
+    else:
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        return dataloader
 
 if __name__ == "__main__":
     class Args:
         batch_size = 32
-        image_size = 256
-        # Caminho relativo baseado em onde você está rodando o script no terminal
-        dataset_path = "./celeba_data/celeba/archive/img_align_celeba"
+        image_size = 256 
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Testando no sistema: {device.upper()}")
+    print(f"🖥️ Testando no sistema: {device.upper()}")
     
-    loader = get_data(Args())
+    # Testando no modo Single-GPU (is_distributed=False)
+    loader = get_data(Args(), is_distributed=False)
     
     images, labels = next(iter(loader))
-    print(f"Batch carregado com sucesso. Shape: {images.shape}")
-    print(f"Range de pixel: {images.min():.2f} a {images.max():.2f}")
+    print(f"📦 Batch carregado com sucesso. Shape: {images.shape}")
+    print(f"🎨 Range de pixel: {images.min():.2f} a {images.max():.2f}")

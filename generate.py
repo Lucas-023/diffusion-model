@@ -3,7 +3,7 @@ import torch
 import argparse
 from models.unet import UNet
 from diffusion.ddpm import Diffusion
-from utils.utils import save_images
+from utils.utils_celeba import save_images
 
 def generate(args):
     device = args.device

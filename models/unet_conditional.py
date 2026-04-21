@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 from torch.nn import SiLU as SiLU
 
-from modules import ResidualBlock, Upsample, Downsample, SpatialTransformer, SinusoidalPosEmb
+from models.modules import ResidualBlock, Upsample, Downsample, SpatialTransformer, SinusoidalPosEmb
 
 class UNet_cond(nn.Module):
     def __init__(
