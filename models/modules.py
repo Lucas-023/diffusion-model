@@ -266,13 +266,26 @@ class SpatialTransformer(nn.Module):
         return x + h
 
 class LatentConditionProjector(nn.Module):
-    """Ponte entre a sua VAE e a U-Net"""
-    def __init__(self, latent_dim, context_dim):
+    """Ponte entre a sua VAE e a U-Net (Com Bottleneck de Informação)"""
+    def __init__(self, latent_dim=4, context_dim=512):
         super().__init__()
-        self.proj = nn.Conv1d(latent_dim, context_dim, kernel_size=1)
+        # Destrói a grade espacial 32x32 e tira a média global (vira 1x1)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Projeta os canais latentes para a dimensão de contexto da UNet
+        self.proj = nn.Linear(latent_dim, context_dim)
 
     def forward(self, z_cond):
         b, c, h, w = z_cond.shape
-        z_flat = z_cond.view(b, c, h * w)
-        context = self.proj(z_flat)
+        
+        # 1. Esmaga a imagem: (B, 4, 32, 32) -> (B, 4, 1, 1) -> (B, 4)
+        z_global = self.pool(z_cond).view(b, c)
+        
+        # 2. Projeta para o contexto: (B, 512)
+        context = self.proj(z_global)
+        
+        # 3. Formata para a Cross-Attention da UNet, que geralmente espera (Batch, Seq_Len, Dim)
+        # O nosso Seq_Len agora é apenas 1 "token" super denso contendo o estilo do rosto
+        context = context.unsqueeze(1) # Resultado: (B, 1, 512)
+        
         return context

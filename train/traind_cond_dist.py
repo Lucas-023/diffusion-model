@@ -19,17 +19,14 @@ from board import Board
 from utils.utils_celeba import get_data, save_images, setup_logging
 from diffusion.conditional_ddpm import Diffusion_conditional
 
-# --- NOVOS IMPORTS ---
 from models.unet_conditional import UNet_cond
 from models.modules import LatentConditionProjector
-from vae.modules import VAE # Assumindo que guardou a sua VAE aqui
+from vae.modules import VAE 
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import contextlib
-
-
 
 def setup_ddp():
     """Inicializa o comunicador Multi-Node e Multi-GPU"""
@@ -39,8 +36,7 @@ def setup_ddp():
     torch.cuda.set_device(local_rank)
     return local_rank, global_rank
 
-
-def update_ema(ema_model, model, decay=0.9999): # 0.9999 é melhor para LDM
+def update_ema(ema_model, model, decay=0.9999): 
     """Atualiza os pesos do EMA de forma suave"""
     ema_model.eval()
     with torch.no_grad():
@@ -51,27 +47,27 @@ def train(args):
     local_rank, global_rank = setup_ddp()
     is_master = (global_rank == 0)
     
-    # 1. INICIALIZAÇÃO TENSORBOARD E LOGS (SÓ NO MESTRE)
     if is_master:
         setup_logging(args.run_name)
-        print("\n🚀 LDM Condicional - Modo Multi-GPU (DDP)")
+        print("\n🚀 LDM Condicional (Image-to-Image) - Modo Multi-GPU")
         board = Board(run_name=args.run_name, enabled=True)
         global_step = 0
 
+    # AVISO: A partir de agora, o get_data deve retornar os LATENTES (.pt) e não as imagens (.jpg)
     dataloader, sampler = get_data(args, is_distributed=True)
     
     # --- CONFIGURAÇÃO DO ESPAÇO LATENTE ---
     latent_dim = 4
     context_dim = 512
     
-    # Inicia VAE (Congelada e SEM DDP)
+    # Inicia VAE (Apenas para descompressão no final da época pelo PC Mestre)
     vae = VAE(in_channels=3, latent_dim=latent_dim).to(local_rank)
     # vae.load_state_dict(torch.load("sua_vae.pt", map_location=f"cuda:{local_rank}"))
     vae.eval()
     for param in vae.parameters():
         param.requires_grad = False
 
-    # Inicia UNet e Projetor
+    # Inicia UNet e Projetor (O Projetor agora precisa aceitar entrada espacial 4x32x32)
     model = UNet_cond(in_channels=latent_dim, out_channels=latent_dim, context_dim=context_dim).to(local_rank)
     projector = LatentConditionProjector(latent_dim=latent_dim, context_dim=context_dim).to(local_rank)
     
@@ -82,29 +78,40 @@ def train(args):
     model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
     projector = DDP(projector, device_ids=[local_rank], gradient_as_bucket_view=True)
 
-    # OTIMIZADOR DUPLO
     optimizer = optim.AdamW(
         list(model.parameters()) + list(projector.parameters()), 
         lr=args.lr,
-        weight_decay=1e-4 # Um pouco de regularização ajuda no LDM
+        weight_decay=1e-4 
     )
     
-    # --- SCHEDULER: WARMUP + COSINE ANNEALING ---
-    epocas_warmup = 10 # O LR vai subir suavemente durante as primeiras 10 épocas
-    
-    # 1. Sobe de 1% (0.01) do LR até 100% nas primeiras 10 épocas
+    # --- SCHEDULERS ---
+    epocas_warmup = 10 
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=epocas_warmup)
-    
-    # 2. Depois das 10 épocas, desce em formato de curva de cosseno até um valor mínimo (ex: 1e-6)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=(args.epochs - epocas_warmup), eta_min=1e-6)
-    
-    # 3. Junta os dois sequencialmente
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[epocas_warmup])    
 
     scaler = GradScaler()
     accumulation_steps = 4
-    
     start_epoch = 0
+
+    # --- LÓGICA DE RESUME ---
+    if args.resume_ckpt and os.path.isfile(args.resume_ckpt):
+        if is_master:
+            print(f"🔄 Carregando checkpoint: {args.resume_ckpt}")
+            
+        checkpoint = torch.load(args.resume_ckpt, map_location=f"cuda:{local_rank}")
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+        projector.module.load_state_dict(checkpoint['projector_state_dict'])
+        
+        if is_master and ema_model is not None:
+            ema_model.load_state_dict(checkpoint['ema_state_dict'])
+            
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        
+        if is_master:
+            print(f"✅ Treino retomado a partir da época {start_epoch}!")
+            
     save_dir = os.path.join("models", args.run_name)
     results_dir = os.path.join("results", args.run_name)
 
@@ -112,67 +119,57 @@ def train(args):
         sampler.set_epoch(epoch)
         pbar = tqdm(dataloader) if is_master else dataloader
         
-        epoch_losses = [] # Para calcular a média no final da época
+        epoch_losses = [] 
         
-        for i, (images, _) in enumerate(pbar):
-            images = images.to(local_rank)
+        # MUDANÇA 1: O loop agora recebe 'latents' direto do dataloader
+        for i, (latents, _) in enumerate(pbar):
+            latents = latents.to(local_rank)
             
-            # --- LÓGICA DE ACÚMULO DE GRADIENTES ---
-            # Só sincroniza as placas de rede se for o último passo do acúmulo ou o último batch do dataloader
             is_accumulating = (i + 1) % accumulation_steps != 0 and (i + 1) != len(dataloader)
             
-            # Gerenciadores de contexto para bloquear a sincronização de rede
             sync_model = model.no_sync() if is_accumulating else contextlib.nullcontext()
             sync_proj = projector.no_sync() if is_accumulating else contextlib.nullcontext()
             
-            # O processamento pesado entra aqui
             with sync_model, sync_proj:
-                # AUTOCAST: Converte operações pesadas (FP32) para leves (FP16)
                 with autocast():
-                    with torch.no_grad():
-                        mu, _ = vae.encode(images)
-                        z_target = mu * 0.18215 # Fator de escala
+                    # MUDANÇA 2: A VAE foi removida daqui. Escalonamos o latente diretamente.
+                    z_target = latents * 0.18215 
                     
+                    # MUDANÇA 3: Self-Conditioning. O projetor lê a própria imagem alvo (latente)
                     context = projector(z_target)
-                    t = torch.randint(low=1, high=diffusion.noise_steps, size=(images.shape[0],)).to(local_rank)
+                    
+                    t = torch.randint(low=1, high=diffusion.noise_steps, size=(latents.shape[0],)).to(local_rank)
                     
                     z_t, noise = diffusion.noise_images(z_target, t)
                     predicted_noise = model(z_t, t, context=context)
                     
-                    # Calcula o erro
                     loss = torch.nn.functional.mse_loss(predicted_noise, noise)
-                    # Divide o loss para compensar as somas futuras
                     loss = loss / accumulation_steps
                 
-                # Backward pass escalonado em FP16 (Ainda bloqueado para não ir à rede)
                 scaler.scale(loss).backward()
             
-            # --- ATUALIZAÇÃO DOS PESOS (AGORA SIM VAI PELA REDE) ---
             if not is_accumulating:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 
-                # 2. LOGS DURANTE O BATCH (SÓ NO MESTRE)
                 if is_master:
                     update_ema(ema_model, model.module)
-                    # Multiplicamos o loss de volta só para o gráfico do Tensorboard ficar legível
                     loss_display = loss.item() * accumulation_steps 
                     pbar.set_postfix(MSE=loss_display)
                     board.log_scalar("Loss/Batch", loss_display, global_step)
                     epoch_losses.append(loss_display)
-                    global_step += 1                
-        # --- ATUALIZA O LEARNING RATE (Em todas as GPUs para manter o sincronismo) ---
+                    global_step += 1     
+                           
         scheduler.step()
                 
-        # 3. SALVAR CHECKPOINT E INFERÊNCIA (SÓ NO MESTRE)
+        # 3. SALVAR CHECKPOINT E INFERÊNCIA
         if is_master:
             avg_loss = sum(epoch_losses) / len(epoch_losses)
             lr_atual = optimizer.param_groups[0]['lr']
             
             print(f"\n📊 Época {epoch} - Loss Médio: {avg_loss:.6f} | LR Atual: {lr_atual:.6f}")
             
-            # Mais logs de acompanhamento geral
             board.log_scalar("Metricas/Loss_Epoca", avg_loss, epoch)
             board.log_scalar("Metricas/Learning_Rate", lr_atual, epoch)
             
@@ -189,24 +186,23 @@ def train(args):
                 }
                 torch.save(checkpoint, os.path.join(save_dir, "ckpt.pt"))
                 
-                # --- INFERÊNCIA NO ESPAÇO LATENTE ---
+                # --- INFERÊNCIA COM LATENT CACHE ---
                 print(f"🎨 A gerar imagens de teste no TensorBoard...")
-                condicoes_reais = images[:16] # Pega 16 imagens do batch para servir de condição
-                
-                # Regista as imagens reais no TensorBoard para compararmos com as geradas
-                grid_condicao = make_grid(condicoes_reais, nrow=4, normalize=True, value_range=(-1, 1))
-                board.log_image("Visualizacao/Condicao_Real", grid_condicao, epoch)
+                latentes_reais = latents[:16] # Pega 16 latentes do batch
                 
                 with torch.no_grad():
-                    mu_cond, _ = vae.encode(condicoes_reais)
-                    context_teste = projector.module(mu_cond * 0.18215) 
+                    # 1. Decodifica os latentes reais para mostrar a "Condição" no TensorBoard
+                    imagens_reais = vae.decode(latentes_reais / 0.18215)
+                    grid_condicao = make_grid(imagens_reais, nrow=4, normalize=True, value_range=(-1, 1))
+                    board.log_image("Visualizacao/Condicao_Real", grid_condicao, epoch)
                     
+                    # 2. Gera os contextos baseados nos latentes e pede para a UNet gerar do zero
+                    context_teste = projector.module(latentes_reais * 0.18215) 
                     sampled_latents = diffusion.sample(ema_model, n=16, context=context_teste)
                     
-                    sampled_latents = sampled_latents / 0.18215
-                    sampled_images = vae.decode(sampled_latents)
+                    # 3. Decodifica as imagens geradas pela UNet
+                    sampled_images = vae.decode(sampled_latents / 0.18215)
                 
-                # Salva no disco e regista as imagens geradas no TensorBoard
                 save_images(sampled_images, os.path.join(results_dir, f"{epoch}.jpg"))
                 grid_gerada = make_grid(sampled_images, nrow=4, normalize=True, value_range=(-1, 1))
                 board.log_image("Visualizacao/Imagem_Gerada", grid_gerada, epoch)
@@ -221,7 +217,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=2500, help="Total de épocas")
     parser.add_argument('--batch_size', type=int, default=128, help="Batch size POR GPU") 
     parser.add_argument('--image_size', type=int, default=256, help="Resolução Original (256)") 
-    parser.add_argument('--lr', type=float, default=2e-4, help="Learning Rate")
+    parser.add_argument('--lr', type=float, default=8e-4, help="Learning Rate")
     parser.add_argument('--resume_ckpt', type=str, default=None, help="Caminho do .pt antigo")
 
     args = parser.parse_args()

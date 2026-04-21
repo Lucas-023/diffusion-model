@@ -1,17 +1,15 @@
 import os
 import torch
 import torchvision
-import pandas as pd
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from matplotlib import pyplot as plt
-from torch.utils.data import DataLoader, ConcatDataset
-import torchvision
-import torchvision.transforms as T
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler # <-- Importante para o Multi-GPU
 
-
+# ==========================================
+# 1. FUNÇÕES MANTIDAS (NÃO APAGUE!)
+# O train.py precisa delas para salvar logs e imagens
+# ==========================================
 def plot_images(images):
     plt.figure(figsize=(32, 32))
     plt.imshow(torch.cat([
@@ -27,62 +25,47 @@ def save_images(images, path, **kwargs):
     im = Image.fromarray(ndarr)
     im.save(path)
 
-
-# Atualize a sua função get_data para esta:
-def get_data(args, is_distributed=False):
-    transforms = T.Compose([
-        T.CenterCrop(178),
-        T.Resize((args.image_size, args.image_size)),
-        T.RandomHorizontalFlip(p=0.5),
-        T.ToTensor(),
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    
-    # Substituímos a classe chata do PyTorch pela nossa:
-    dataset = MeuCelebA(
-        root="/home/al.lucas.barcelos/Modelos/diffusion-model/CelebA_data", 
-        transform=transforms
-    )
-    
-    if is_distributed:
-        sampler = DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False, num_workers=8, pin_memory=True)
-        return dataloader, sampler
-    else:
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-        return dataloader
-    
-
 def setup_logging(run_name):
     os.makedirs("models", exist_ok=True)
     os.makedirs("results", exist_ok=True)
     os.makedirs(os.path.join("models", run_name), exist_ok=True)
     os.makedirs(os.path.join("results", run_name), exist_ok=True)
 
-
-class MeuCelebA(Dataset):
-    def __init__(self, root, transform=None):
-        # Adicione mais um "img_align_celeba" no final da lista do os.path.join:
-        self.img_dir = os.path.join(root, "celeba", "img_align_celeba", "img_align_celeba") 
-        
-        self.transform = transform        
-        # Lê o arquivo que renomeamos para .txt (mas que por dentro tem as vírgulas do Kaggle)
-        attr_path = os.path.join(root, "celeba", "list_attr_celeba.txt")
-        self.df = pd.read_csv(attr_path) 
-        
-        self.img_names = self.df['image_id'].values
-        # Pega as labels dos atributos e converte para formato PyTorch
-        self.labels = (self.df.drop('image_id', axis=1).values > 0).astype(int)
+# ==========================================
+# 2. NOVA LÓGICA: LATENT CACHE
+# ==========================================
+class CelebALatentDataset(Dataset):
+    def __init__(self, latent_dir):
+        self.latent_dir = latent_dir
+        self.latent_files = [f for f in os.listdir(latent_dir) if f.endswith('.pt')]
 
     def __len__(self):
-        return len(self.img_names)
+        return len(self.latent_files)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, self.img_names[idx])
-        image = Image.open(img_path).convert("RGB")
-        
-        if self.transform:
-            image = self.transform(image)
-            
-        label = torch.tensor(self.labels[idx], dtype=torch.long)
-        return image, label
+        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
+        # map_location='cpu' evita estourar a memória da GPU 0 acidentalmente
+        latent = torch.load(latent_path, map_location='cpu')
+        return latent, 0 
+
+def get_data(args, is_distributed=True):
+    # ATENÇÃO: Defina aqui o caminho onde a pasta 'latents_cache' vai ficar
+    latent_dir = "/home/al.lucas.barcelos/Modelos/diffusion-model/CelebA_data/latents_cache"
+    
+    dataset = CelebALatentDataset(latent_dir)
+    
+    if is_distributed:
+        sampler = DistributedSampler(dataset, shuffle=True)
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            sampler=sampler, 
+            shuffle=False,  # DDP requer shuffle False aqui (o Sampler já embaralha)
+            num_workers=8,  # Manti os 8 workers que você já usava!
+            pin_memory=True,
+            drop_last=True  # Crucial para evitar Deadlock no Multi-GPU
+        )
+        return dataloader, sampler
+    else:
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+        return dataloader, None
