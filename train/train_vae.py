@@ -47,7 +47,7 @@ def train_vae():
     image_size = 256
     epochs = 100
     learning_rate = 1e-4
-    dataset_path = "./celeba_data/celeba/archive/img_align_celeba"
+    dataset_path = "./CelebA_data/celeba/img_align_celeba"
     
     # Pesos das perdas
     kl_weight = 1e-6          

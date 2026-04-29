@@ -4,7 +4,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
 
-pip install tqdm matplotlib pillow types-python-dateutil
+pip install tqdm matplotlib pillow types-python-dateutil tensorboard
 
 ddpm with 32x32 images:
 🎉 FID Score: 3.35
