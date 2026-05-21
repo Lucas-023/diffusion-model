@@ -276,3 +276,60 @@ class LatentConditionProjector(nn.Module):
         x = self.proj(z_cond)              # [B, 512, 32, 32]
         x = x.view(x.shape[0], x.shape[1], -1)   # [B, 512, 1024]
         return x
+    
+class AttributeEmbedder(nn.Module):
+    """
+    Transforma atributos binários do CelebA em tokens semânticos
+    para Cross-Attention da U-Net.
+
+    Entrada:
+        attrs -> [B, num_attributes]
+
+    Saída:
+        context -> [B, context_dim, num_attributes]
+    """
+
+    def __init__(
+        self,
+        num_attributes=40,
+        context_dim=512
+    ):
+        super().__init__()
+
+        self.num_attributes = num_attributes
+        self.context_dim = context_dim
+
+        # Cada atributo possui seu próprio embedding
+        self.embedding = nn.Embedding(
+            num_embeddings=2,   # 0 ou 1
+            embedding_dim=context_dim
+        )
+
+        # Embedding posicional do atributo
+        # ajuda a rede distinguir:
+        # "Smiling" != "Male"
+        self.attribute_tokens = nn.Parameter(
+            torch.randn(num_attributes, context_dim)
+        )
+
+    def forward(self, attrs):
+        """
+        attrs:
+            shape = [B, 40]
+            valores = 0 ou 1
+        """
+
+        attrs = attrs.long()
+
+        # embedding binário
+        # [B, 40, 512]
+        x = self.embedding(attrs)
+
+        # adiciona identidade semântica do atributo
+        x = x + self.attribute_tokens.unsqueeze(0)
+
+        # transformer espera:
+        # [B, C, T]
+        x = x.permute(0, 2, 1)
+
+        return x

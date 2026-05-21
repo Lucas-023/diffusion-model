@@ -14,7 +14,7 @@ def make_cache():
     vae.load_state_dict(torch.load("vae/vae_epoch_62.pt"))
     vae.eval()
     
-    pasta_imagens = "CelebA_data/celeba/img_align_celeba/img_align_celeba"
+    pasta_imagens = "CelebA_data/img_align_celeba/img_align_celeba"
     pasta_cache = "cache_latent"
     os.makedirs(pasta_cache, exist_ok=True)
     
