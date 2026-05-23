@@ -245,6 +245,12 @@ def train(args):
             latents = batch[0].to(device)
             attributes = batch[1].to(device)
 
+            if fixed_latents is None:
+
+                fixed_latents = latents[:16].clone()
+
+                fixed_attributes = attributes[:16].clone()
+
             optimizer.zero_grad(set_to_none=True)
 
             with autocast():
