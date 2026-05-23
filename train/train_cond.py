@@ -242,9 +242,15 @@ def train(args):
 
         for i, batch in enumerate(pbar):
 
-            latents = batch["latent"].to(device)
+            if isinstance(batch, dict):
 
-            attributes = batch["attrs"].to(device)
+                latents = batch["latent"].to(device)
+                attributes = batch["attrs"].to(device)
+
+            else:
+
+                latents = batch[0].to(device)
+                attributes = batch[1].to(device)
             if fixed_latents is None:
 
                 fixed_latents = latents[:16]
