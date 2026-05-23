@@ -242,20 +242,8 @@ def train(args):
 
         for i, batch in enumerate(pbar):
 
-            if isinstance(batch, dict):
-
-                latents = batch["latent"].to(device)
-                attributes = batch["attrs"].to(device)
-
-            else:
-
-                latents = batch[0].to(device)
-                attributes = batch[1].to(device)
-            if fixed_latents is None:
-
-                fixed_latents = latents[:16]
-
-                fixed_attributes = attributes[:16]
+            latents = batch[0].to(device)
+            attributes = batch[1].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 

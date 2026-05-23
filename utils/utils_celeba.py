@@ -190,17 +190,20 @@ class CelebALatentConditionalDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        latent_filename, attrs = self.samples[idx]
+        latent_filename, _ = self.samples[idx]
 
         latent_path = os.path.join(
             self.latent_dir,
             latent_filename
         )
 
-        latent = torch.load(
+        data = torch.load(
             latent_path,
             map_location="cpu"
         )
+
+        latent = data["latent"]
+        attrs = data["attrs"]
 
         return latent, attrs
 
