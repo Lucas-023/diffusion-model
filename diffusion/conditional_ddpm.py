@@ -1,87 +1,160 @@
 import torch
-import torch.nn as nn
-from tqdm import tqdm 
+from tqdm import tqdm
 import logging
-import numpy as np
 
 class Diffusion_conditional:
-    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=32, device="cuda"):
+
+    def __init__(
+        self,
+        noise_steps=1000,
+        beta_start=1e-4,
+        beta_end=0.02,
+        img_size=32,
+        device="cuda"
+    ):
+
         self.noise_steps = noise_steps
+
         self.beta_start = beta_start
         self.beta_end = beta_end
+
         self.img_size = img_size
+
         self.device = device
-        
-        # definimos o beta (taxa de destruição da imagem)
+
         self.beta = self.prepare_noise_schedule().to(device)
-        
-        # definimos o alpha(quanto da imagem original sobra)
+
         self.alpha = 1. - self.beta
-        
-        # alpha hat (alpha_cumprod) é o acumulado até o passo t
-        # serve para irmos diretamente ao passo t sem passar por todos os anteriores
-        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+
+        self.alpha_hat = torch.cumprod(
+            self.alpha,
+            dim=0
+        )
 
     def prepare_noise_schedule(self):
-        return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
-    
+
+        return torch.linspace(
+            self.beta_start,
+            self.beta_end,
+            self.noise_steps
+        )
+
     def noise_images(self, x, t):
-        # colocando ruído na imagem        
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
-        
+
+        sqrt_alpha_hat = torch.sqrt(
+            self.alpha_hat[t]
+        )[:, None, None, None]
+
+        sqrt_one_minus_alpha_hat = torch.sqrt(
+            1 - self.alpha_hat[t]
+        )[:, None, None, None]
+
         epsilon = torch.randn_like(x)
-        
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
-    
+
+        return (
+            sqrt_alpha_hat * x +
+            sqrt_one_minus_alpha_hat * epsilon,
+            epsilon
+        )
+
     def sample_timesteps(self, n):
-        # sorteando o t
-        return torch.randint(1, self.noise_steps, size=(n,))
-    
-    # --- MUDANÇA 1: Adicionado 'context' e 'channels' ---
-    def sample(self, model, n, context=None, channels=4):
-        # fazendo sample de n imagens
-        logging.info(f"Sampling {n} new images....")
+
+        return torch.randint(
+            1,
+            self.noise_steps,
+            size=(n,)
+        )
+
+    def sample(
+        self,
+        model,
+        n,
+        context=None,
+        channels=4,
+        cfg_scale=3.0
+    ):
+
+        logging.info(f"Sampling {n} images...")
+
         model.eval()
+
         with torch.no_grad():
-            # --- MUDANÇA 2: Usando a variável 'channels' em vez do 3 fixo ---
-            x = torch.randn((n, channels, self.img_size, self.img_size)).to(self.device)
-            
-            for i in tqdm(reversed(range(0, self.noise_steps)), position=0):
-                t = (torch.ones(n) * i).long().to(self.device)
-                
-                # --- MUDANÇA 3: Roteamento condicional vs incondicional ---
+
+            x = torch.randn(
+                (
+                    n,
+                    channels,
+                    self.img_size,
+                    self.img_size
+                )
+            ).to(self.device)
+
+            for i in tqdm(
+                reversed(range(1, self.noise_steps)),
+                position=0
+            ):
+
+                t = (
+                    torch.ones(n) * i
+                ).long().to(self.device)
+
                 if context is not None:
-                    predicted_noise = model(x, t, context=context)
+
+                    noise_pred_cond = model(
+                        x,
+                        t,
+                        context=context
+                    )
+
+                    noise_pred_uncond = model(
+                        x,
+                        t,
+                        context=torch.zeros_like(context)
+                    )
+
+                    predicted_noise = (
+                        noise_pred_uncond +
+                        cfg_scale * (
+                            noise_pred_cond -
+                            noise_pred_uncond
+                        )
+                    )
+
                 else:
-                    predicted_noise = model(x, t)
-                
-                # Coeficientes
+
+                    predicted_noise = model(
+                        x,
+                        t,
+                        context=torch.zeros(
+                            n,
+                            512,
+                            40
+                        ).to(self.device)
+                    )
+
                 alpha = self.alpha[t][:, None, None, None]
+
                 alpha_hat = self.alpha_hat[t][:, None, None, None]
+
                 beta = self.beta[t][:, None, None, None]
-                
-                if i > 0:
+
+                if i > 1:
                     noise = torch.randn_like(x)
                 else:
                     noise = torch.zeros_like(x)
-                
-                x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-        
-        model.train()
-        return x    
 
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Lembre-se: Para 256x256 com VAE f=8, o img_size aqui deve ser 32
-    diff = Diffusion(img_size=32, device=device) 
-    
-    # Teste no espaço latente (4 canais)
-    fake_latent = torch.randn(2, 4, 32, 32).to(device)
-    t = diff.sample_timesteps(2).to(device)
-    
-    noisy_latent, noise = diff.noise_images(fake_latent, t)
-    
-    print("✅ Gerenciador de Difusão criado com sucesso!")
-    print(f"✅ Shape do latente ruidoso: {noisy_latent.shape}")
-    print(f"✅ Shape do ruído isolado: {noise.shape}")
+                x = (
+                    1 / torch.sqrt(alpha)
+                ) * (
+                    x - (
+                        (
+                            1 - alpha
+                        ) / torch.sqrt(
+                            1 - alpha_hat
+                        )
+                    ) * predicted_noise
+                ) + torch.sqrt(beta) * noise
+
+        model.train()
+
+        return x

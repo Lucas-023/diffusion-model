@@ -1,3 +1,7 @@
+# ============================================================
+# TRAIN SINGLE GPU - LATENT DIFFUSION CONDICIONAL
+# ============================================================
+
 import os
 import torch
 import torch.nn as nn
@@ -10,35 +14,41 @@ from torch.cuda.amp import GradScaler, autocast
 from torchvision.utils import make_grid
 
 from board import Board
-from utils.utils_celeba import save_images, setup_logging, get_data
+
+from utils.utils_celeba import (
+    get_data,
+    save_images,
+    setup_logging
+)
 
 from diffusion.conditional_ddpm import Diffusion_conditional
 
 from models.unet_conditional import UNet_cond
+from models.modules import AttributeEmbedder
+
 from vae.modules import VAE
 
 
-# =========================================================
-# EMA
-# =========================================================
+def update_ema(
+    ema_model,
+    model,
+    decay=0.9999
+):
 
-def update_ema(ema_model, model, decay=0.9999):
     ema_model.eval()
 
     with torch.no_grad():
+
         for ema_param, param in zip(
             ema_model.parameters(),
             model.parameters()
         ):
+
             ema_param.data.mul_(decay).add_(
                 param.data,
                 alpha=(1 - decay)
             )
 
-
-# =========================================================
-# TREINO
-# =========================================================
 
 def train(args):
 
@@ -46,31 +56,30 @@ def train(args):
 
     device = args.device
 
-    board = Board(
-        run_name=args.run_name,
-        enabled=True
-    )
-
-    global_step = 0
-
-    # =====================================================
-    # DATASET
-    # =====================================================
-
     dataloader, _ = get_data(
         args,
         is_distributed=False
     )
 
-    # =====================================================
-    # MODELOS
-    # =====================================================
-
     latent_dim = 4
+    context_dim = 512
 
-    # -----------------------------------------------------
-    # VAE
-    # -----------------------------------------------------
+    save_dir = os.path.join(
+        "models",
+        args.run_name
+    )
+
+    results_dir = os.path.join(
+        "results",
+        args.run_name
+    )
+
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # ========================================================
+    # VAE (APENAS DECODER)
+    # ========================================================
 
     vae = VAE(
         in_channels=3,
@@ -89,75 +98,90 @@ def train(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    # -----------------------------------------------------
+    # ========================================================
     # UNET
-    # -----------------------------------------------------
+    # ========================================================
 
     model = UNet_cond(
         in_channels=latent_dim,
         out_channels=latent_dim,
-        context_dim=args.context_dim,
-        num_classes=args.num_classes
+        context_dim=context_dim
     ).to(device)
 
-    ema_model = deepcopy(model).eval()
+    # ========================================================
+    # ATTRIBUTE EMBEDDER
+    # ========================================================
+
+    attribute_embedder = AttributeEmbedder(
+        num_attributes=40,
+        context_dim=context_dim
+    ).to(device)
+
+    # ========================================================
+    # EMA
+    # ========================================================
+
+    ema_model = deepcopy(model)
+
+    ema_attribute_embedder = deepcopy(
+        attribute_embedder
+    )
+
+    ema_model.eval()
+    ema_attribute_embedder.eval()
 
     for p in ema_model.parameters():
         p.requires_grad = False
 
-    # =====================================================
-    # DIFUSÃO
-    # =====================================================
+    for p in ema_attribute_embedder.parameters():
+        p.requires_grad = False
 
-    diffusion = Diffusion_conditional(
-        img_size=args.image_size // 8,
-        device=device
-    )
-
-    # =====================================================
-    # OTIMIZADOR
-    # =====================================================
+    # ========================================================
+    # OPTIMIZER
+    # ========================================================
 
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4
+
+        list(model.parameters()) +
+
+        list(attribute_embedder.parameters()),
+
+        lr=args.lr
+    )
+
+    mse = nn.MSELoss()
+
+    diffusion = Diffusion_conditional(
+        img_size=32,
+        device=device
     )
 
     scaler = GradScaler()
 
-    # =====================================================
-    # CHECKPOINT
-    # =====================================================
-
-    save_dir = os.path.join(
-        "models",
-        args.run_name
+    board = Board(
+        run_name=args.run_name,
+        enabled=True
     )
 
-    results_dir = os.path.join(
-        "results",
-        args.run_name
-    )
-
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
+    global_step = 0
+    start_epoch = 0
 
     ckpt_path = os.path.join(
         save_dir,
         "ckpt.pt"
     )
 
-    start_epoch = 0
-    best_loss = float("inf")
+    # ========================================================
+    # RESUME
+    # ========================================================
 
-    if os.path.exists(ckpt_path):
+    if args.resume_ckpt and os.path.isfile(args.resume_ckpt):
 
         print(f"\n🔄 Carregando checkpoint:")
-        print(ckpt_path)
+        print(args.resume_ckpt)
 
         checkpoint = torch.load(
-            ckpt_path,
+            args.resume_ckpt,
             map_location=device
         )
 
@@ -165,49 +189,49 @@ def train(args):
             checkpoint["model_state_dict"]
         )
 
+        attribute_embedder.load_state_dict(
+            checkpoint["attribute_embedder_state_dict"]
+        )
+
         ema_model.load_state_dict(
-            checkpoint["ema_state_dict"]
+            checkpoint["ema_model_state_dict"]
+        )
+
+        ema_attribute_embedder.load_state_dict(
+            checkpoint["ema_attribute_embedder_state_dict"]
         )
 
         optimizer.load_state_dict(
             checkpoint["optimizer_state_dict"]
         )
 
-        if "scaler_state_dict" in checkpoint:
-            scaler.load_state_dict(
-                checkpoint["scaler_state_dict"]
-            )
+        scaler.load_state_dict(
+            checkpoint["scaler_state_dict"]
+        )
 
         start_epoch = checkpoint["epoch"] + 1
 
-        best_loss = checkpoint.get(
-            "loss",
-            float("inf")
-        )
-
-        print(f"✅ Retomando da época {start_epoch}")
+        print(f"✅ Retomando treino da época {start_epoch}")
 
     else:
 
         print("\nNenhum checkpoint encontrado.")
         print("Treino começando do zero.")
 
-    # =====================================================
-    # FIXED BATCH
-    # =====================================================
+    # ========================================================
+    # FIXED LATENTS
+    # ========================================================
 
-    fixed_latents, fixed_attrs = next(iter(dataloader))
+    fixed_latents = None
+    fixed_attributes = None
 
-    fixed_latents = fixed_latents[:16].to(device)
-    fixed_attrs = fixed_attrs[:16].to(device)
-
-    # =====================================================
-    # LOOP
-    # =====================================================
+    # ========================================================
+    # TRAIN LOOP
+    # ========================================================
 
     for epoch in range(start_epoch, args.epochs):
 
-        logging.info(f"Iniciando época {epoch}")
+        logging.info(f"A iniciar época {epoch}")
 
         pbar = tqdm(
             dataloader,
@@ -216,56 +240,59 @@ def train(args):
 
         epoch_losses = []
 
-        for latents, attrs in pbar:
+        for i, (latents, attributes) in enumerate(pbar):
 
             latents = latents.to(device)
-            attrs = attrs.to(device)
 
-            # ---------------------------------------------
-            # SCALE LATENT
-            # ---------------------------------------------
+            attributes = attributes.to(device)
 
-            z_target = latents * 0.18215
+            if fixed_latents is None:
 
-            # ---------------------------------------------
-            # TIMESTEPS
-            # ---------------------------------------------
+                fixed_latents = latents[:16]
 
-            t = diffusion.sample_timesteps(
-                latents.shape[0]
-            ).to(device)
-
-            # ---------------------------------------------
-            # ADD NOISE
-            # ---------------------------------------------
-
-            z_t, noise = diffusion.noise_images(
-                z_target,
-                t
-            )
+                fixed_attributes = attributes[:16]
 
             optimizer.zero_grad(set_to_none=True)
 
-            # ---------------------------------------------
-            # FORWARD
-            # ---------------------------------------------
-
             with autocast():
+
+                # =============================================
+                # CONDITIONING
+                # =============================================
+
+                context = attribute_embedder(
+                    attributes
+                )
+
+                # classifier free guidance
+
+                if torch.rand(1).item() < 0.1:
+
+                    context = torch.zeros_like(context)
+
+                # =============================================
+                # DIFFUSION
+                # =============================================
+
+                t = diffusion.sample_timesteps(
+                    latents.shape[0]
+                ).to(device)
+
+                z_t, noise = diffusion.noise_images(
+                    latents,
+                    t
+                )
 
                 predicted_noise = model(
                     z_t,
                     t,
-                    attrs
+                    context=context
                 )
 
-                loss = nn.functional.mse_loss(
+                loss = mse(
                     predicted_noise,
                     noise
                 )
-
-            # ---------------------------------------------
-            # BACKWARD
-            # ---------------------------------------------
 
             scaler.scale(loss).backward()
 
@@ -273,18 +300,19 @@ def train(args):
 
             scaler.update()
 
-            # ---------------------------------------------
+            # =================================================
             # EMA
-            # ---------------------------------------------
+            # =================================================
 
             update_ema(
                 ema_model,
                 model
             )
 
-            # ---------------------------------------------
-            # LOG
-            # ---------------------------------------------
+            update_ema(
+                ema_attribute_embedder,
+                attribute_embedder
+            )
 
             epoch_losses.append(loss.item())
 
@@ -300,14 +328,10 @@ def train(args):
 
             global_step += 1
 
-        # =================================================
-        # FIM ÉPOCA
-        # =================================================
-
         avg_loss = sum(epoch_losses) / len(epoch_losses)
 
         print(f"\n📊 Época {epoch}")
-        print(f"Loss médio: {avg_loss:.6f}")
+        print(f"Loss Médio: {avg_loss:.6f}")
 
         board.log_scalar(
             "Loss/Epoch",
@@ -315,17 +339,31 @@ def train(args):
             epoch
         )
 
-        # =================================================
+        # ====================================================
         # CHECKPOINT
-        # =================================================
+        # ====================================================
 
         checkpoint = {
+
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "ema_state_dict": ema_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "loss": avg_loss,
+
+            "model_state_dict":
+                model.state_dict(),
+
+            "attribute_embedder_state_dict":
+                attribute_embedder.state_dict(),
+
+            "ema_model_state_dict":
+                ema_model.state_dict(),
+
+            "ema_attribute_embedder_state_dict":
+                ema_attribute_embedder.state_dict(),
+
+            "optimizer_state_dict":
+                optimizer.state_dict(),
+
+            "scaler_state_dict":
+                scaler.state_dict(),
         }
 
         torch.save(
@@ -333,59 +371,24 @@ def train(args):
             ckpt_path
         )
 
-        # -------------------------------------------------
-        # BEST
-        # -------------------------------------------------
-
-        if avg_loss < best_loss:
-
-            best_loss = avg_loss
-
-            torch.save(
-                checkpoint,
-                os.path.join(
-                    save_dir,
-                    "best_ckpt.pt"
-                )
-            )
-
-            print(
-                f"🏆 Novo melhor modelo salvo!"
-            )
-
-        # -------------------------------------------------
-        # PERIODIC
-        # -------------------------------------------------
-
-        if epoch % 25 == 0 and epoch > 0:
-
-            torch.save(
-                checkpoint,
-                os.path.join(
-                    save_dir,
-                    f"ckpt_epoch_{epoch}.pt"
-                )
-            )
-
-            print(
-                f"📦 Checkpoint periódico salvo!"
-            )
-
-        # =================================================
-        # SAMPLE
-        # =================================================
+        # ====================================================
+        # INFERENCE
+        # ====================================================
 
         if epoch % 25 == 0 or epoch == args.epochs - 1:
 
-            print("\n🎨 Gerando imagens...")
+            print("🎨 Gerando imagens...")
 
             with torch.no_grad():
+
+                context_teste = ema_attribute_embedder(
+                    fixed_attributes
+                )
 
                 sampled_latents = diffusion.sample(
                     ema_model,
                     n=16,
-                    labels=fixed_attrs,
-                    channels=latent_dim
+                    context=context_teste
                 )
 
                 sampled_latents = (
@@ -397,7 +400,9 @@ def train(args):
                 )
 
             save_images(
+
                 sampled_images,
+
                 os.path.join(
                     results_dir,
                     f"{epoch}.jpg"
@@ -419,12 +424,6 @@ def train(args):
 
     board.close()
 
-    print("\n✅ Treinamento finalizado!")
-
-
-# =========================================================
-# MAIN
-# =========================================================
 
 if __name__ == "__main__":
 
@@ -433,51 +432,45 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--run_name",
+        '--run_name',
         type=str,
-        default="LDM_CelebA_Attributes"
+        default="LDM_Conditional_Attributes"
     )
 
     parser.add_argument(
-        "--epochs",
+        '--epochs',
         type=int,
         default=1000
     )
 
     parser.add_argument(
-        "--batch_size",
+        '--batch_size',
         type=int,
         default=128
     )
 
     parser.add_argument(
-        "--image_size",
+        '--image_size',
         type=int,
         default=256
     )
 
     parser.add_argument(
-        "--device",
+        '--device',
         type=str,
         default="cuda"
     )
 
     parser.add_argument(
-        "--lr",
+        '--lr',
         type=float,
         default=2e-4
     )
 
     parser.add_argument(
-        "--context_dim",
-        type=int,
-        default=512
-    )
-
-    parser.add_argument(
-        "--num_classes",
-        type=int,
-        default=40
+        '--resume_ckpt',
+        type=str,
+        default=None
     )
 
     args = parser.parse_args()

@@ -1,66 +1,78 @@
 import os
 import torch
 import torchvision
+
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
 from matplotlib import pyplot as plt
-from torchvision import transforms
 
 # ==========================================
 # FUNÇÕES AUXILIARES
 # ==========================================
 
 def plot_images(images):
+
     plt.figure(figsize=(32, 32))
-    plt.imshow(torch.cat([
-        torch.cat([i for i in images.cpu()], dim=-1),
-    ], dim=-2).permute(1, 2, 0).cpu())
+
+    plt.imshow(
+        torch.cat([
+            torch.cat([i for i in images.cpu()], dim=-1),
+        ], dim=-2).permute(1, 2, 0).cpu()
+    )
+
     plt.show()
 
+
 def save_images(images, path, **kwargs):
+
     images = (images.clamp(-1, 1) + 1) / 2
     images = (images * 255).type(torch.uint8)
 
-    grid = torchvision.utils.make_grid(images, **kwargs)
+    grid = torchvision.utils.make_grid(
+        images,
+        **kwargs
+    )
 
-    ndarr = grid.permute(1, 2, 0).to('cpu').numpy()
+    ndarr = grid.permute(1, 2, 0).cpu().numpy()
 
     im = Image.fromarray(ndarr)
 
     im.save(path)
 
+
 def setup_logging(run_name):
+
     os.makedirs("models", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    os.makedirs(os.path.join("models", run_name), exist_ok=True)
-    os.makedirs(os.path.join("results", run_name), exist_ok=True)
+    os.makedirs(
+        os.path.join("models", run_name),
+        exist_ok=True
+    )
+
+    os.makedirs(
+        os.path.join("results", run_name),
+        exist_ok=True
+    )
 
 # ==========================================
-# DATASET CONDICIONAL CELEBA
+# DATASET:
+# LATENTES + ATRIBUTOS
 # ==========================================
 
-class CelebAConditionalDataset(Dataset):
+class CelebALatentConditionalDataset(Dataset):
 
     def __init__(
         self,
-        image_dir,
-        attr_path,
-        image_size=256
+        latent_dir,
+        attr_path
     ):
 
-        self.image_dir = image_dir
-
-        self.transform = transforms.Compose([
-            transforms.CenterCrop(178),
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                [0.5, 0.5, 0.5],
-                [0.5, 0.5, 0.5]
-            )
-        ])
+        self.latent_dir = latent_dir
 
         with open(attr_path, "r") as f:
             lines = f.readlines()
@@ -77,52 +89,80 @@ class CelebAConditionalDataset(Dataset):
 
             filename = split[0]
 
-            attrs = list(map(int, split[1:]))
+            attrs = list(
+                map(int, split[1:])
+            )
 
-            # converte {-1,1} -> {0,1}
-            attrs = [(x + 1) // 2 for x in attrs]
+            # {-1,1} -> {0,1}
+            attrs = [
+                (x + 1) // 2
+                for x in attrs
+            ]
 
             attrs = torch.tensor(
                 attrs,
                 dtype=torch.float32
             )
 
-            self.samples.append(
-                (filename, attrs)
+            latent_filename = (
+                filename.split(".")[0]
+                + ".pt"
             )
 
+            latent_path = os.path.join(
+                latent_dir,
+                latent_filename
+            )
+
+            # garante que o latent existe
+            if os.path.exists(latent_path):
+
+                self.samples.append(
+                    (
+                        latent_filename,
+                        attrs
+                    )
+                )
+
     def __len__(self):
+
         return len(self.samples)
 
     def __getitem__(self, idx):
 
-        filename, attrs = self.samples[idx]
+        latent_filename, attrs = self.samples[idx]
 
-        image_path = os.path.join(
-            self.image_dir,
-            filename
+        latent_path = os.path.join(
+            self.latent_dir,
+            latent_filename
         )
 
-        image = Image.open(image_path).convert("RGB")
+        latent = torch.load(
+            latent_path,
+            map_location="cpu"
+        )
 
-        image = self.transform(image)
-
-        return image, attrs
+        return latent, attrs
 
 # ==========================================
 # DATALOADER
 # ==========================================
 
-def get_data(args, is_distributed=True):
+def get_data(
+    args,
+    is_distributed=True
+):
 
-    image_dir = "./CelebA_data/celeba/img_align_celeba"
+    latent_dir = "./cache_latent"
 
-    attr_path = "./CelebA_data/celeba/list_attr_celeba.txt"
+    attr_path = (
+        "./CelebA_data/celeba/"
+        "list_attr_celeba.txt"
+    )
 
-    dataset = CelebAConditionalDataset(
-        image_dir=image_dir,
-        attr_path=attr_path,
-        image_size=args.image_size
+    dataset = CelebALatentConditionalDataset(
+        latent_dir=latent_dir,
+        attr_path=attr_path
     )
 
     if is_distributed:
@@ -139,7 +179,9 @@ def get_data(args, is_distributed=True):
             shuffle=False,
             num_workers=8,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=4
         )
 
         return dataloader, sampler
@@ -152,7 +194,9 @@ def get_data(args, is_distributed=True):
             shuffle=True,
             num_workers=8,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=4
         )
 
         return dataloader, None
