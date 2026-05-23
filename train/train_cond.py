@@ -240,12 +240,11 @@ def train(args):
 
         epoch_losses = []
 
-        for i, (latents, attributes) in enumerate(pbar):
+        for i, batch in enumerate(pbar):
 
-            latents = latents.to(device)
+            latents = batch["latent"].to(device)
 
-            attributes = attributes.to(device)
-
+            attributes = batch["attrs"].to(device)
             if fixed_latents is None:
 
                 fixed_latents = latents[:16]
