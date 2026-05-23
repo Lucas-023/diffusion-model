@@ -15,7 +15,7 @@ from vae.modules import VAE
 
 # ============================================================
 # LOAD ATTRIBUTES
-# SUPORTA .TXT E .CSV
+# SUPORTA TXT E CSV
 # ============================================================
 
 def load_attributes(attr_path):
@@ -23,7 +23,7 @@ def load_attributes(attr_path):
     attributes_dict = {}
 
     # ========================================================
-    # FORMATO TXT ORIGINAL
+    # TXT ORIGINAL
     # ========================================================
 
     if attr_path.endswith(".txt"):
@@ -57,7 +57,7 @@ def load_attributes(attr_path):
             attributes_dict[filename] = attrs
 
     # ========================================================
-    # FORMATO CSV KAGGLE
+    # CSV KAGGLE
     # ========================================================
 
     else:
@@ -128,7 +128,7 @@ def make_cache():
     )
 
     # ========================================================
-    # DETECTA TXT OU CSV
+    # DETECTA ARQUIVO DE ATRIBUTOS
     # ========================================================
 
     if os.path.exists(txt_attr_path):
@@ -202,7 +202,7 @@ def make_cache():
     ])
 
     # ========================================================
-    # IMAGE LIST
+    # IMAGE FILES
     # ========================================================
 
     image_files = sorted([
@@ -232,7 +232,7 @@ def make_cache():
             try:
 
                 # ============================================
-                # IMAGE
+                # LOAD IMAGE
                 # ============================================
 
                 img_path = os.path.join(
@@ -252,9 +252,26 @@ def make_cache():
                 # VAE ENCODE
                 # ============================================
 
-                posterior = vae.encode(image)
+                # SUA VAE RETORNA:
+                # mu, logvar
 
-                latents = posterior.sample()
+                mu, logvar = vae.encode(image)
+
+                # ====================================================
+                # LATENTE DETERMINÍSTICO
+                # ====================================================
+
+                # NÃO usamos sample()
+                # NÃO usamos ruído aleatório
+                # cache totalmente determinístico
+
+                latents = mu
+
+                # ====================================================
+                # ESCALING FACTOR
+                # ====================================================
+
+                # mantém variância parecida com Stable Diffusion
 
                 latents = latents * 0.18215
 
