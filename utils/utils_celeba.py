@@ -74,55 +74,115 @@ class CelebALatentConditionalDataset(Dataset):
 
         self.latent_dir = latent_dir
 
-        with open(attr_path, "r") as f:
-            lines = f.readlines()
+        # ======================================
+        # SUPORTE PARA .TXT OU .CSV
+        # ======================================
 
-        self.num_images = int(lines[0])
+        if attr_path.endswith(".txt"):
 
-        self.attr_names = lines[1].split()
+            with open(attr_path, "r") as f:
+                lines = f.readlines()
 
-        self.samples = []
+            self.num_images = int(lines[0])
 
-        for line in lines[2:]:
+            self.attr_names = lines[1].split()
 
-            split = line.strip().split()
+            self.samples = []
 
-            filename = split[0]
+            for line in lines[2:]:
 
-            attrs = list(
-                map(int, split[1:])
-            )
+                split = line.strip().split()
 
-            # {-1,1} -> {0,1}
-            attrs = [
-                (x + 1) // 2
-                for x in attrs
-            ]
+                filename = split[0]
 
-            attrs = torch.tensor(
-                attrs,
-                dtype=torch.float32
-            )
-
-            latent_filename = (
-                filename.split(".")[0]
-                + ".pt"
-            )
-
-            latent_path = os.path.join(
-                latent_dir,
-                latent_filename
-            )
-
-            # garante que o latent existe
-            if os.path.exists(latent_path):
-
-                self.samples.append(
-                    (
-                        latent_filename,
-                        attrs
-                    )
+                attrs = list(
+                    map(int, split[1:])
                 )
+
+                # {-1,1} -> {0,1}
+                attrs = [
+                    (x + 1) // 2
+                    for x in attrs
+                ]
+
+                attrs = torch.tensor(
+                    attrs,
+                    dtype=torch.float32
+                )
+
+                latent_filename = (
+                    filename.split(".")[0]
+                    + ".pt"
+                )
+
+                latent_path = os.path.join(
+                    latent_dir,
+                    latent_filename
+                )
+
+                if os.path.exists(latent_path):
+
+                    self.samples.append(
+                        (
+                            latent_filename,
+                            attrs
+                        )
+                    )
+
+        else:
+
+            # ==================================
+            # CSV DO KAGGLE
+            # ==================================
+
+            import pandas as pd
+
+            df = pd.read_csv(attr_path)
+
+            self.attr_names = list(df.columns[1:])
+
+            self.samples = []
+
+            for _, row in df.iterrows():
+
+                filename = row.iloc[0]
+
+                attrs = row.iloc[1:].tolist()
+
+                attrs = [
+                    1 if x == 1 else 0
+                    for x in attrs
+                ]
+
+                attrs = torch.tensor(
+                    attrs,
+                    dtype=torch.float32
+                )
+
+                latent_filename = (
+                    filename.split(".")[0]
+                    + ".pt"
+                )
+
+                latent_path = os.path.join(
+                    latent_dir,
+                    latent_filename
+                )
+
+                if os.path.exists(latent_path):
+
+                    self.samples.append(
+                        (
+                            latent_filename,
+                            attrs
+                        )
+                    )
+
+        print("\n===================================")
+        print(f"Dataset carregado:")
+        print(f"Latentes encontrados: {len(self.samples)}")
+        print(f"Número de atributos: {len(self.attr_names)}")
+        print("===================================\n")
 
     def __len__(self):
 
@@ -155,10 +215,33 @@ def get_data(
 
     latent_dir = "./cache_latent"
 
-    attr_path = (
+    # ======================================
+    # DETECTA AUTOMATICAMENTE
+    # ======================================
+
+    txt_path = (
         "./CelebA_data/celeba/"
         "list_attr_celeba.txt"
     )
+
+    csv_path = (
+        "./CelebA_data/celeba/"
+        "list_attr_celeba.csv"
+    )
+
+    if os.path.exists(txt_path):
+
+        attr_path = txt_path
+
+    elif os.path.exists(csv_path):
+
+        attr_path = csv_path
+
+    else:
+
+        raise FileNotFoundError(
+            "Nenhum arquivo de atributos encontrado."
+        )
 
     dataset = CelebALatentConditionalDataset(
         latent_dir=latent_dir,

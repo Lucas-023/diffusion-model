@@ -1,7 +1,10 @@
-# Arquivo: create_cache.py
+# ============================================================
+# CACHE GENERATOR
+# ============================================================
 
 import os
 import torch
+import pandas as pd
 
 from tqdm import tqdm
 from PIL import Image
@@ -10,67 +13,155 @@ from torchvision import transforms
 from vae.modules import VAE
 
 
+# ============================================================
+# LOAD ATTRIBUTES
+# SUPORTA .TXT E .CSV
+# ============================================================
+
 def load_attributes(attr_path):
-
-    with open(attr_path, "r") as f:
-        lines = f.readlines()
-
-    attr_names = lines[1].split()
 
     attributes_dict = {}
 
-    for line in lines[2:]:
+    # ========================================================
+    # FORMATO TXT ORIGINAL
+    # ========================================================
 
-        split = line.strip().split()
+    if attr_path.endswith(".txt"):
 
-        filename = split[0]
+        with open(attr_path, "r") as f:
+            lines = f.readlines()
 
-        attrs = list(map(int, split[1:]))
+        attr_names = lines[1].split()
 
-        # {-1,1} -> {0,1}
-        attrs = [(x + 1) // 2 for x in attrs]
+        for line in lines[2:]:
 
-        attrs = torch.tensor(
-            attrs,
-            dtype=torch.float32
-        )
+            split = line.strip().split()
 
-        attributes_dict[filename] = attrs
+            filename = split[0]
+
+            attrs = list(
+                map(int, split[1:])
+            )
+
+            # {-1,1} -> {0,1}
+            attrs = [
+                (x + 1) // 2
+                for x in attrs
+            ]
+
+            attrs = torch.tensor(
+                attrs,
+                dtype=torch.float32
+            )
+
+            attributes_dict[filename] = attrs
+
+    # ========================================================
+    # FORMATO CSV KAGGLE
+    # ========================================================
+
+    else:
+
+        df = pd.read_csv(attr_path)
+
+        attr_names = list(df.columns[1:])
+
+        for _, row in df.iterrows():
+
+            filename = row.iloc[0]
+
+            attrs = row.iloc[1:].tolist()
+
+            attrs = [
+                1 if x == 1 else 0
+                for x in attrs
+            ]
+
+            attrs = torch.tensor(
+                attrs,
+                dtype=torch.float32
+            )
+
+            attributes_dict[filename] = attrs
 
     return attributes_dict, attr_names
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def make_cache():
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
     print(f"\n🚀 Device: {device}")
 
-    # =====================================================
+    # ========================================================
     # PATHS
-    # =====================================================
+    # ========================================================
 
-    image_dir = "./CelebA_data/celeba/img_align_celeba"
+    image_dir = (
+        "./CelebA_data/celeba/"
+        "img_align_celeba/img_align_celeba"
+    )
 
-    attr_path = "./CelebA_data/celeba/list_attr_celeba.txt"
+    txt_attr_path = (
+        "./CelebA_data/celeba/"
+        "list_attr_celeba.txt"
+    )
+
+    csv_attr_path = (
+        "./CelebA_data/celeba/"
+        "list_attr_celeba.csv"
+    )
 
     cache_dir = "./cache_latent"
 
-    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(
+        cache_dir,
+        exist_ok=True
+    )
 
-    # =====================================================
+    # ========================================================
+    # DETECTA TXT OU CSV
+    # ========================================================
+
+    if os.path.exists(txt_attr_path):
+
+        attr_path = txt_attr_path
+
+    elif os.path.exists(csv_attr_path):
+
+        attr_path = csv_attr_path
+
+    else:
+
+        raise FileNotFoundError(
+            "Arquivo de atributos não encontrado."
+        )
+
+    # ========================================================
     # LOAD ATTRIBUTES
-    # =====================================================
+    # ========================================================
 
     print("\n📄 Carregando atributos...")
 
-    attributes_dict, attr_names = load_attributes(attr_path)
+    attributes_dict, attr_names = load_attributes(
+        attr_path
+    )
 
-    print(f"✅ {len(attr_names)} atributos encontrados")
+    print(
+        f"✅ {len(attr_names)} atributos encontrados"
+    )
 
-    # =====================================================
+    # ========================================================
     # LOAD VAE
-    # =====================================================
+    # ========================================================
 
     print("\n🧠 Carregando VAE...")
 
@@ -89,11 +180,12 @@ def make_cache():
     vae.eval()
 
     for param in vae.parameters():
+
         param.requires_grad = False
 
-    # =====================================================
+    # ========================================================
     # TRANSFORM
-    # =====================================================
+    # ========================================================
 
     transform = transforms.Compose([
 
@@ -109,20 +201,27 @@ def make_cache():
         )
     ])
 
-    # =====================================================
+    # ========================================================
     # IMAGE LIST
-    # =====================================================
+    # ========================================================
 
     image_files = sorted([
+
         f for f in os.listdir(image_dir)
-        if f.endswith((".jpg", ".png"))
+
+        if f.endswith(
+            (".jpg", ".png")
+        )
     ])
 
-    print(f"\n🖼️ Total de imagens: {len(image_files)}")
+    print(
+        f"\n🖼️ Total de imagens: "
+        f"{len(image_files)}"
+    )
 
-    # =====================================================
+    # ========================================================
     # CACHE LOOP
-    # =====================================================
+    # ========================================================
 
     print("\n⚡ Criando latent cache...\n")
 
@@ -132,44 +231,57 @@ def make_cache():
 
             try:
 
+                # ============================================
+                # IMAGE
+                # ============================================
+
                 img_path = os.path.join(
                     image_dir,
                     img_name
                 )
 
-                image = Image.open(img_path).convert("RGB")
+                image = Image.open(
+                    img_path
+                ).convert("RGB")
 
                 image = transform(image)
 
                 image = image.unsqueeze(0).to(device)
 
-                # =========================================
+                # ============================================
                 # VAE ENCODE
-                # =========================================
+                # ============================================
 
-                mu, logvar = vae.encode(image)
+                posterior = vae.encode(image)
 
-                latent = mu * 0.18215
+                latents = posterior.sample()
 
-                latent = latent.squeeze(0).cpu()
+                latents = latents * 0.18215
 
-                # =========================================
+                latents = latents.squeeze(0).cpu()
+
+                # ============================================
                 # ATTRIBUTES
-                # =========================================
+                # ============================================
 
                 attrs = attributes_dict[img_name]
 
-                # =========================================
+                # ============================================
                 # SAVE
-                # =========================================
+                # ============================================
 
                 save_dict = {
-                    "latent": latent,
+
+                    "latent": latents,
+
                     "attrs": attrs
                 }
 
-                save_name = img_name.replace(".jpg", ".pt")
-                save_name = save_name.replace(".png", ".pt")
+                save_name = (
+                    img_name
+                    .replace(".jpg", ".pt")
+                    .replace(".png", ".pt")
+                )
 
                 save_path = os.path.join(
                     cache_dir,
@@ -184,11 +296,17 @@ def make_cache():
             except Exception as e:
 
                 print(f"\n❌ Erro em {img_name}")
+
                 print(e)
 
     print("\n✅ Cache criado com sucesso!")
+
     print(f"📁 Salvo em: {cache_dir}")
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
 
