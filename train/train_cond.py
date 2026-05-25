@@ -3,14 +3,16 @@
 # ============================================================
 
 import os
+import logging
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import logging
+import torch.amp
 
 from tqdm import tqdm
 from copy import deepcopy
-from torch.cuda.amp import GradScaler, autocast
+
 from torchvision.utils import make_grid
 
 from board import Board
@@ -21,13 +23,31 @@ from utils.utils_celeba import (
     setup_logging
 )
 
-from diffusion.conditional_ddpm import Diffusion_conditional
+from diffusion.conditional_ddpm import (
+    Diffusion_conditional
+)
 
-from models.unet_conditional import UNet_cond
-from models.modules import AttributeEmbedder
+from models.unet_conditional import (
+    UNet_cond
+)
+
+from models.modules import (
+    AttributeEmbedder
+)
 
 from vae.modules import VAE
 
+
+# ============================================================
+# CUDA
+# ============================================================
+
+torch.backends.cudnn.benchmark = True
+
+
+# ============================================================
+# EMA
+# ============================================================
 
 def update_ema(
     ema_model,
@@ -50,16 +70,28 @@ def update_ema(
             )
 
 
+# ============================================================
+# TRAIN
+# ============================================================
+
 def train(args):
 
     setup_logging(args.run_name)
 
     device = args.device
 
+    # ========================================================
+    # DATA
+    # ========================================================
+
     train_loader, val_loader, test_loader, _ = get_data(
         args,
         is_distributed=False
     )
+
+    # ========================================================
+    # CONFIG
+    # ========================================================
 
     latent_dim = 4
     context_dim = 512
@@ -78,7 +110,7 @@ def train(args):
     os.makedirs(results_dir, exist_ok=True)
 
     # ========================================================
-    # VAE (APENAS DECODER)
+    # VAE
     # ========================================================
 
     vae = VAE(
@@ -96,6 +128,7 @@ def train(args):
     vae.eval()
 
     for param in vae.parameters():
+
         param.requires_grad = False
 
     # ========================================================
@@ -131,9 +164,11 @@ def train(args):
     ema_attribute_embedder.eval()
 
     for p in ema_model.parameters():
+
         p.requires_grad = False
 
     for p in ema_attribute_embedder.parameters():
+
         p.requires_grad = False
 
     # ========================================================
@@ -149,35 +184,64 @@ def train(args):
         lr=args.lr
     )
 
+    # ========================================================
+    # LOSS
+    # ========================================================
+
     mse = nn.MSELoss()
+
+    # ========================================================
+    # DIFFUSION
+    # ========================================================
 
     diffusion = Diffusion_conditional(
         img_size=32,
         device=device
     )
 
-    scaler = GradScaler()
+    # ========================================================
+    # AMP
+    # ========================================================
+
+    scaler = torch.amp.GradScaler("cuda")
+
+    # ========================================================
+    # TENSORBOARD
+    # ========================================================
 
     board = Board(
         run_name=args.run_name,
         enabled=True
     )
 
+    # ========================================================
+    # STATE
+    # ========================================================
+
     global_step = 0
     start_epoch = 0
+
+    best_val_loss = float("inf")
 
     ckpt_path = os.path.join(
         save_dir,
         "ckpt.pt"
     )
 
+    best_ckpt_path = os.path.join(
+        save_dir,
+        "best_ckpt.pt"
+    )
+
     # ========================================================
     # RESUME
     # ========================================================
 
-    if args.resume_ckpt and os.path.isfile(args.resume_ckpt):
+    if args.resume_ckpt and os.path.isfile(
+        args.resume_ckpt
+    ):
 
-        print(f"\n🔄 Carregando checkpoint:")
+        print("\n🔄 Carregando checkpoint:")
         print(args.resume_ckpt)
 
         checkpoint = torch.load(
@@ -190,7 +254,9 @@ def train(args):
         )
 
         attribute_embedder.load_state_dict(
-            checkpoint["attribute_embedder_state_dict"]
+            checkpoint[
+                "attribute_embedder_state_dict"
+            ]
         )
 
         ema_model.load_state_dict(
@@ -198,7 +264,9 @@ def train(args):
         )
 
         ema_attribute_embedder.load_state_dict(
-            checkpoint["ema_attribute_embedder_state_dict"]
+            checkpoint[
+                "ema_attribute_embedder_state_dict"
+            ]
         )
 
         optimizer.load_state_dict(
@@ -211,7 +279,16 @@ def train(args):
 
         start_epoch = checkpoint["epoch"] + 1
 
-        print(f"✅ Retomando treino da época {start_epoch}")
+        if "val_loss" in checkpoint:
+
+            best_val_loss = checkpoint[
+                "val_loss"
+            ]
+
+        print(
+            f"✅ Retomando treino "
+            f"da época {start_epoch}"
+        )
 
     else:
 
@@ -219,19 +296,26 @@ def train(args):
         print("Treino começando do zero.")
 
     # ========================================================
-    # FIXED LATENTS
+    # FIXED ATTRIBUTES
     # ========================================================
 
-    fixed_latents = None
     fixed_attributes = None
 
     # ========================================================
     # TRAIN LOOP
     # ========================================================
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(
+        start_epoch,
+        args.epochs
+    ):
 
-        logging.info(f"A iniciar época {epoch}")
+        logging.info(
+            f"A iniciar época {epoch}"
+        )
+
+        model.train()
+        attribute_embedder.train()
 
         pbar = tqdm(
             train_loader,
@@ -240,53 +324,82 @@ def train(args):
 
         epoch_losses = []
 
-        for i, batch in enumerate(pbar):
+        # ====================================================
+        # TRAIN STEP
+        # ====================================================
 
-            latents = batch[0].to(device)
-            attributes = batch[1].to(device)
+        for batch in pbar:
 
-            if fixed_latents is None:
+            latents = batch[0].to(
+                device,
+                non_blocking=True
+            )
 
-                fixed_latents = latents[:16].clone()
+            attributes = batch[1].to(
+                device,
+                non_blocking=True
+            )
 
-                fixed_attributes = attributes[:16].clone()
+            if fixed_attributes is None:
 
-            optimizer.zero_grad(set_to_none=True)
+                fixed_attributes = (
+                    attributes[:16].clone()
+                )
 
-            with autocast():
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
-                # =============================================
+            with torch.amp.autocast("cuda"):
+
+                # ============================================
                 # CONDITIONING
-                # =============================================
+                # ============================================
 
                 context = attribute_embedder(
                     attributes
                 )
 
-                # classifier free guidance
+                # ============================================
+                # CLASSIFIER FREE GUIDANCE
+                # ============================================
 
                 if torch.rand(1).item() < 0.1:
 
-                    context = torch.zeros_like(context)
+                    context = torch.zeros_like(
+                        context
+                    )
 
-                # =============================================
-                # DIFFUSION
-                # =============================================
+                # ============================================
+                # TIMESTEPS
+                # ============================================
 
                 t = diffusion.sample_timesteps(
                     latents.shape[0]
                 ).to(device)
+
+                # ============================================
+                # NOISE
+                # ============================================
 
                 z_t, noise = diffusion.noise_images(
                     latents,
                     t
                 )
 
+                # ============================================
+                # PREDICTION
+                # ============================================
+
                 predicted_noise = model(
                     z_t,
                     t,
                     context=context
                 )
+
+                # ============================================
+                # LOSS
+                # ============================================
 
                 loss = mse(
                     predicted_noise,
@@ -299,9 +412,9 @@ def train(args):
 
             scaler.update()
 
-            # =================================================
+            # ================================================
             # EMA
-            # =================================================
+            # ================================================
 
             update_ema(
                 ema_model,
@@ -313,7 +426,9 @@ def train(args):
                 attribute_embedder
             )
 
-            epoch_losses.append(loss.item())
+            epoch_losses.append(
+                loss.item()
+            )
 
             pbar.set_postfix(
                 MSE=loss.item()
@@ -327,7 +442,10 @@ def train(args):
 
             global_step += 1
 
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        avg_loss = (
+            sum(epoch_losses)
+            / len(epoch_losses)
+        )
 
         # ====================================================
         # VALIDATION
@@ -342,36 +460,46 @@ def train(args):
 
             val_pbar = tqdm(
                 val_loader,
-                desc=f"Validação {epoch}/{args.epochs}",
+                desc=(
+                    f"Validação "
+                    f"{epoch}/{args.epochs}"
+                ),
                 leave=False
             )
 
             for batch in val_pbar:
 
-                latents = batch[0].to(device)
-                attributes = batch[1].to(device)
+                latents = batch[0].to(
+                    device,
+                    non_blocking=True
+                )
 
-                with autocast():
+                attributes = batch[1].to(
+                    device,
+                    non_blocking=True
+                )
 
-                    # =========================================
-                    # CONDITIONING
-                    # =========================================
+                with torch.amp.autocast("cuda"):
 
-                    context = attribute_embedder(
-                        attributes
+                    context = (
+                        attribute_embedder(
+                            attributes
+                        )
                     )
 
-                    # =========================================
-                    # DIFFUSION
-                    # =========================================
+                    t = (
+                        diffusion
+                        .sample_timesteps(
+                            latents.shape[0]
+                        )
+                        .to(device)
+                    )
 
-                    t = diffusion.sample_timesteps(
-                        latents.shape[0]
-                    ).to(device)
-
-                    z_t, noise = diffusion.noise_images(
-                        latents,
-                        t
+                    z_t, noise = (
+                        diffusion.noise_images(
+                            latents,
+                            t
+                        )
                     )
 
                     predicted_noise = model(
@@ -390,15 +518,25 @@ def train(args):
                 )
 
         avg_val_loss = (
-            sum(val_losses) / len(val_losses)
+            sum(val_losses)
+            / len(val_losses)
         )
 
-        model.train()
-        attribute_embedder.train()
-
         print(f"\n📊 Época {epoch}")
-        print(f"Train Loss: {avg_loss:.6f}")
-        print(f"Val Loss:   {avg_val_loss:.6f}")
+
+        print(
+            f"Train Loss: "
+            f"{avg_loss:.6f}"
+        )
+
+        print(
+            f"Val Loss:   "
+            f"{avg_val_loss:.6f}"
+        )
+
+        # ====================================================
+        # TENSORBOARD
+        # ====================================================
 
         board.log_scalar(
             "Loss/Epoch",
@@ -418,7 +556,8 @@ def train(args):
 
         checkpoint = {
 
-            "epoch": epoch,
+            "epoch":
+                epoch,
 
             "model_state_dict":
                 model.state_dict(),
@@ -437,6 +576,9 @@ def train(args):
 
             "scaler_state_dict":
                 scaler.state_dict(),
+
+            "val_loss":
+                avg_val_loss
         }
 
         torch.save(
@@ -445,23 +587,54 @@ def train(args):
         )
 
         # ====================================================
+        # BEST MODEL
+        # ====================================================
+
+        if avg_val_loss < best_val_loss:
+
+            best_val_loss = avg_val_loss
+
+            torch.save(
+                checkpoint,
+                best_ckpt_path
+            )
+
+            print(
+                f"✅ Novo melhor modelo salvo "
+                f"(Val Loss: "
+                f"{avg_val_loss:.6f})"
+            )
+
+        # ====================================================
         # INFERENCE
         # ====================================================
 
-        if epoch % 25 == 0 or epoch == args.epochs - 1:
+        if (
+            epoch % 25 == 0
+            or epoch == args.epochs - 1
+        ):
 
-            print("🎨 Gerando imagens...")
+            print("\n🎨 Gerando imagens...")
+
+            ema_model.eval()
+            ema_attribute_embedder.eval()
 
             with torch.no_grad():
 
-                context_teste = ema_attribute_embedder(
-                    fixed_attributes
+                context_teste = (
+                    ema_attribute_embedder(
+                        fixed_attributes.to(
+                            device
+                        )
+                    )
                 )
 
-                sampled_latents = diffusion.sample(
-                    ema_model,
-                    n=16,
-                    context=context_teste
+                sampled_latents = (
+                    diffusion.sample(
+                        ema_model,
+                        n=16,
+                        context=context_teste
+                    )
                 )
 
                 sampled_latents = (
@@ -479,7 +652,9 @@ def train(args):
                 os.path.join(
                     results_dir,
                     f"{epoch}.jpg"
-                )
+                ),
+
+                nrow=4
             )
 
             grid = make_grid(
@@ -495,8 +670,83 @@ def train(args):
                 epoch
             )
 
+    # ========================================================
+    # TEST EVALUATION
+    # ========================================================
+
+    print("\n🧪 Avaliando no conjunto de teste...")
+
+    model.eval()
+    attribute_embedder.eval()
+
+    test_losses = []
+
+    with torch.no_grad():
+
+        for batch in tqdm(test_loader):
+
+            latents = batch[0].to(
+                device,
+                non_blocking=True
+            )
+
+            attributes = batch[1].to(
+                device,
+                non_blocking=True
+            )
+
+            with torch.amp.autocast("cuda"):
+
+                context = attribute_embedder(
+                    attributes
+                )
+
+                t = diffusion.sample_timesteps(
+                    latents.shape[0]
+                ).to(device)
+
+                z_t, noise = diffusion.noise_images(
+                    latents,
+                    t
+                )
+
+                predicted_noise = model(
+                    z_t,
+                    t,
+                    context=context
+                )
+
+                test_loss = mse(
+                    predicted_noise,
+                    noise
+                )
+
+            test_losses.append(
+                test_loss.item()
+            )
+
+    avg_test_loss = (
+        sum(test_losses)
+        / len(test_losses)
+    )
+
+    print(
+        f"\n🧪 Test Loss Final: "
+        f"{avg_test_loss:.6f}"
+    )
+
+    board.log_scalar(
+        "Loss/Test",
+        avg_test_loss,
+        0
+    )
+
     board.close()
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 

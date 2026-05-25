@@ -218,6 +218,10 @@ def get_data(
 
     latent_dir = "./cache_latent"
 
+    # ======================================
+    # DETECTA AUTOMATICAMENTE
+    # ======================================
+
     txt_path = (
         "./CelebA_data/celeba/"
         "list_attr_celeba.txt"
@@ -242,28 +246,42 @@ def get_data(
             "Nenhum arquivo de atributos encontrado."
         )
 
+    # ======================================
+    # DATASET GLOBAL
+    # ======================================
+
     dataset = CelebALatentConditionalDataset(
         latent_dir=latent_dir,
         attr_path=attr_path
     )
 
-    # ==================================================
-    # SPLIT
-    # ==================================================
+    # ======================================
+    # SPLITS
+    # ======================================
 
-    total_size = len(dataset)
+    train_size = int(0.70 * len(dataset))
 
-    train_size = int(0.70 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
+    val_size = int(0.15 * len(dataset))
 
-    generator = torch.Generator().manual_seed(42)
-
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset,
-        [train_size, val_size, test_size],
-        generator=generator
+    test_size = (
+        len(dataset)
+        - train_size
+        - val_size
     )
+
+    train_dataset, val_dataset, test_dataset = \
+        torch.utils.data.random_split(
+
+            dataset,
+
+            [
+                train_size,
+                val_size,
+                test_size
+            ],
+
+            generator=torch.Generator().manual_seed(42)
+        )
 
     print("\n===================================")
     print("DATASET SPLITS")
@@ -272,9 +290,9 @@ def get_data(
     print(f"Test:  {len(test_dataset)}")
     print("===================================\n")
 
-    # ==================================================
-    # TRAIN DATALOADER
-    # ==================================================
+    # ======================================
+    # DATALOADERS
+    # ======================================
 
     if is_distributed:
 
@@ -283,66 +301,148 @@ def get_data(
             shuffle=True
         )
 
+        val_sampler = DistributedSampler(
+            val_dataset,
+            shuffle=False
+        )
+
+        test_sampler = DistributedSampler(
+            test_dataset,
+            shuffle=False
+        )
+
         train_loader = DataLoader(
+
             train_dataset,
+
             batch_size=args.batch_size,
+
             sampler=train_sampler,
+
             shuffle=False,
+
             num_workers=8,
+
             pin_memory=True,
+
             drop_last=True,
+
             persistent_workers=True,
+
             prefetch_factor=4
+        )
+
+        val_loader = DataLoader(
+
+            val_dataset,
+
+            batch_size=args.batch_size,
+
+            sampler=val_sampler,
+
+            shuffle=False,
+
+            num_workers=8,
+
+            pin_memory=True,
+
+            drop_last=False,
+
+            persistent_workers=True,
+
+            prefetch_factor=4
+        )
+
+        test_loader = DataLoader(
+
+            test_dataset,
+
+            batch_size=args.batch_size,
+
+            sampler=test_sampler,
+
+            shuffle=False,
+
+            num_workers=8,
+
+            pin_memory=True,
+
+            drop_last=False,
+
+            persistent_workers=True,
+
+            prefetch_factor=4
+        )
+
+        return (
+            train_loader,
+            val_loader,
+            test_loader,
+            train_sampler
         )
 
     else:
 
-        train_sampler = None
-
         train_loader = DataLoader(
+
             train_dataset,
+
             batch_size=args.batch_size,
+
             shuffle=True,
+
             num_workers=8,
+
             pin_memory=True,
+
             drop_last=True,
+
             persistent_workers=True,
+
             prefetch_factor=4
         )
 
-    # ==================================================
-    # VAL DATALOADER
-    # ==================================================
+        val_loader = DataLoader(
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=False,
-        persistent_workers=True,
-        prefetch_factor=4
-    )
+            val_dataset,
 
-    # ==================================================
-    # TEST DATALOADER
-    # ==================================================
+            batch_size=args.batch_size,
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        drop_last=False,
-        persistent_workers=True,
-        prefetch_factor=4
-    )
+            shuffle=False,
 
-    return (
-        train_loader,
-        val_loader,
-        test_loader,
-        train_sampler
-    )
+            num_workers=8,
+
+            pin_memory=True,
+
+            drop_last=False,
+
+            persistent_workers=True,
+
+            prefetch_factor=4
+        )
+
+        test_loader = DataLoader(
+
+            test_dataset,
+
+            batch_size=args.batch_size,
+
+            shuffle=False,
+
+            num_workers=8,
+
+            pin_memory=True,
+
+            drop_last=False,
+
+            persistent_workers=True,
+
+            prefetch_factor=4
+        )
+
+        return (
+            train_loader,
+            val_loader,
+            test_loader,
+            None
+        )
