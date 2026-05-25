@@ -56,7 +56,7 @@ def train(args):
 
     device = args.device
 
-    dataloader, _ = get_data(
+    train_loader, val_loader, test_loader, _ = get_data(
         args,
         is_distributed=False
     )
@@ -234,8 +234,8 @@ def train(args):
         logging.info(f"A iniciar época {epoch}")
 
         pbar = tqdm(
-            dataloader,
-            desc=f"Época {epoch}/{args.epochs}"
+            train_loader,
+            desc=f"Treino {epoch}/{args.epochs}"
         )
 
         epoch_losses = []
@@ -329,12 +329,86 @@ def train(args):
 
         avg_loss = sum(epoch_losses) / len(epoch_losses)
 
+        # ====================================================
+        # VALIDATION
+        # ====================================================
+
+        model.eval()
+        attribute_embedder.eval()
+
+        val_losses = []
+
+        with torch.no_grad():
+
+            val_pbar = tqdm(
+                val_loader,
+                desc=f"Validação {epoch}/{args.epochs}",
+                leave=False
+            )
+
+            for batch in val_pbar:
+
+                latents = batch[0].to(device)
+                attributes = batch[1].to(device)
+
+                with autocast():
+
+                    # =========================================
+                    # CONDITIONING
+                    # =========================================
+
+                    context = attribute_embedder(
+                        attributes
+                    )
+
+                    # =========================================
+                    # DIFFUSION
+                    # =========================================
+
+                    t = diffusion.sample_timesteps(
+                        latents.shape[0]
+                    ).to(device)
+
+                    z_t, noise = diffusion.noise_images(
+                        latents,
+                        t
+                    )
+
+                    predicted_noise = model(
+                        z_t,
+                        t,
+                        context=context
+                    )
+
+                    val_loss = mse(
+                        predicted_noise,
+                        noise
+                    )
+
+                val_losses.append(
+                    val_loss.item()
+                )
+
+        avg_val_loss = (
+            sum(val_losses) / len(val_losses)
+        )
+
+        model.train()
+        attribute_embedder.train()
+
         print(f"\n📊 Época {epoch}")
-        print(f"Loss Médio: {avg_loss:.6f}")
+        print(f"Train Loss: {avg_loss:.6f}")
+        print(f"Val Loss:   {avg_val_loss:.6f}")
 
         board.log_scalar(
             "Loss/Epoch",
             avg_loss,
+            epoch
+        )
+
+        board.log_scalar(
+            "Loss/Validation",
+            avg_val_loss,
             epoch
         )
 
