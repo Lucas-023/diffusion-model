@@ -1,8 +1,26 @@
-# ignora tudo
+# Ignora tudo por padrão
 *
 
-# permite pastas
+# Permite pastas
 !*/
 
-# permite arquivos python
+# --- O QUE VOCÊ QUER SUBIR ---
+# permite códigos python
 !*.py
+# permite imagens
+!*.png
+!*.jpg
+!*.jpeg
+
+# --- BLOQUEIO ABSOLUTO (Muito importante) ---
+# Ignora ambientes virtuais (mesmo que tenham arquivos .py dentro)
+.venv/
+venv/
+env/
+__pycache__/
+
+# Ignora pesos do modelo para não estourar o limite do GitHub
+*.pt
+*.pth
+*.ckpt
+*.safetensors
