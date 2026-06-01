@@ -19,7 +19,7 @@ from board import Board
 
 from utils.utils_celeba import (
     get_data,
-    save_images,s
+    save_images,
     setup_logging
 )
 
