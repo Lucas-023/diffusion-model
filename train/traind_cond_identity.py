@@ -111,8 +111,9 @@ def build_context(
       - nenhum (totalmente incondicional)
     """
 
-    attr_ctx = attribute_embedder(attrs)          # [B, 512, 40]
-    id_tokens = identity_adapter(identity_emb)    # [B, 512, num_tokens]
+    attr_ctx = attribute_embedder(attrs)                        # [B, 512, 40]
+    identity_emb = identity_emb.to(dtype=attr_ctx.dtype)       # alinha dtype (float16 sob autocast)
+    id_tokens = identity_adapter(identity_emb)                 # [B, 512, num_tokens]
 
     if training:
 
