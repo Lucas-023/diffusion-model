@@ -1,12 +1,9 @@
 import os
 import torch
-from torchvision import transforms
 from torchvision.utils import save_image
-from PIL import Image
-from tqdm import tqdm
 
 from models.unet_conditional import UNet_cond
-from models.modules import LatentConditionProjector
+from models.modules import AttributeEmbedder
 from vae.modules import VAE
 from diffusion.conditional_ddpm import Diffusion_conditional
 
@@ -15,19 +12,47 @@ from diffusion.conditional_ddpm import Diffusion_conditional
 # CONFIG
 # ============================================================
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-IMAGE_PATH = "teste.jpg"
+CKPT_PATH = "models/LDM_Conditional_Attributes/ckpt.pt"
 
-CKPT_PATH = "peso/ckpt.pt"
-
-SAVE_DIR = "teste_resultado"
-
-IMAGE_SIZE = 256
+SAVE_DIR = "results/testando"
 
 LATENT_SCALE = 0.18215
 
+NUM_IMAGES = 16
+
+CFG_SCALE = 3.0
+
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ============================================================
+# ATRIBUTOS CELEBA (40 atributos, índice conforme dataset)
+# ============================================================
+# 0:  5_o_Clock_Shadow    1:  Arched_Eyebrows   2:  Attractive
+# 3:  Bags_Under_Eyes     4:  Bald               5:  Bangs
+# 6:  Big_Lips            7:  Big_Nose           8:  Black_Hair
+# 9:  Blond_Hair         10:  Blurry            11:  Brown_Hair
+# 12: Bushy_Eyebrows     13:  Chubby            14:  Double_Chin
+# 15: Eyeglasses         16:  Goatee            17:  Gray_Hair
+# 18: Heavy_Makeup       19:  High_Cheekbones   20:  Male
+# 21: Mouth_Slightly_Open 22: Mustache          23:  Narrow_Eyes
+# 24: No_Beard           25:  Oval_Face         26:  Pale_Skin
+# 27: Pointy_Nose        28:  Receding_Hairline 29:  Rosy_Cheeks
+# 30: Sideburns          31:  Smiling           32:  Straight_Hair
+# 33: Wavy_Hair          34:  Wearing_Earrings  35:  Wearing_Hat
+# 36: Wearing_Lipstick   37:  Wearing_Necklace  38:  Wearing_Necktie
+# 39: Young
+# ============================================================
+
+# Exemplo: mulher jovem sorrindo com maquiagem
+ATTRS_ON = [2, 5, 18, 19, 24, 25, 31, 33, 34, 36, 39]
+
+attrs = torch.zeros(40, dtype=torch.float32)
+for idx in ATTRS_ON:
+    attrs[idx] = 1.0
+
+attrs = attrs.unsqueeze(0).repeat(NUM_IMAGES, 1).to(DEVICE)
 
 
 # ============================================================
@@ -36,10 +61,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 print("Carregando modelos...")
 
-vae = VAE(
-    in_channels=3,
-    latent_dim=4
-).to(DEVICE)
+vae = VAE(in_channels=3, latent_dim=4).to(DEVICE)
 
 unet = UNet_cond(
     in_channels=4,
@@ -47,21 +69,33 @@ unet = UNet_cond(
     context_dim=512
 ).to(DEVICE)
 
-projector = LatentConditionProjector(
-    latent_dim=4,
+attribute_embedder = AttributeEmbedder(
+    num_attributes=40,
     context_dim=512
 ).to(DEVICE)
 
 ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
 
-unet.load_state_dict(ckpt["ema_state_dict"])
-projector.load_state_dict(ckpt["projector_state_dict"])
+# Carrega pesos EMA se disponíveis (melhor qualidade)
+unet_weights = ckpt.get("ema_state_dict", ckpt.get("model_state_dict"))
+embedder_weights = ckpt.get(
+    "ema_embedder_state_dict",
+    ckpt.get("attribute_embedder_state_dict")
+)
+
+unet.load_state_dict(unet_weights)
+attribute_embedder.load_state_dict(embedder_weights)
+
+vae_ckpt_path = "vae/vae_epoch_62.pt"
+vae.load_state_dict(
+    torch.load(vae_ckpt_path, map_location=DEVICE)
+)
 
 vae.eval()
 unet.eval()
-projector.eval()
+attribute_embedder.eval()
 
-print("Modelos carregados.")
+print(f"Modelos carregados. (época {ckpt.get('epoch', '?')})")
 
 
 # ============================================================
@@ -75,134 +109,33 @@ diffusion = Diffusion_conditional(
 
 
 # ============================================================
-# LOAD IMAGE
+# GERAÇÃO COM CFG
 # ============================================================
 
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
-])
+print(f"Gerando {NUM_IMAGES} imagens com CFG={CFG_SCALE}...")
 
-img = Image.open(IMAGE_PATH).convert("RGB")
+with torch.no_grad():
 
-img_tensor = transform(img).unsqueeze(0).to(DEVICE)
+    context = attribute_embedder(attrs)
+
+    sampled_latents = diffusion.sample(
+        unet,
+        n=NUM_IMAGES,
+        context=context,
+        channels=4,
+        cfg_scale=CFG_SCALE
+    )
+
+    sampled_latents = sampled_latents / LATENT_SCALE
+
+    images = vae.decode(sampled_latents)
+
+images = (images.clamp(-1, 1) + 1) / 2
 
 save_image(
-    (img_tensor * 0.5 + 0.5).clamp(0, 1),
-    os.path.join(SAVE_DIR, "condicao.png")
+    images,
+    os.path.join(SAVE_DIR, "geradas.png"),
+    nrow=4
 )
 
-print("Imagem carregada.")
-
-
-# ============================================================
-# ENCODE IMAGE -> LATENT
-# ============================================================
-
-with torch.no_grad():
-
-    mu, log_var = vae.encode(img_tensor)
-
-    z = vae.reparameterize(mu, log_var)
-
-    z = z * LATENT_SCALE
-
-print("Latente criado:", z.shape)
-
-
-# ============================================================
-# CREATE CONTEXT
-# ============================================================
-
-with torch.no_grad():
-
-    context = projector(z)
-
-print("Contexto:", context.shape)
-
-
-# ============================================================
-# START FROM PURE NOISE
-# ============================================================
-
-x = torch.randn((1, 4, 32, 32)).to(DEVICE)
-
-print("Iniciando denoising...")
-
-
-# ============================================================
-# DDPM REVERSE PROCESS
-# ============================================================
-
-with torch.no_grad():
-
-    for i in tqdm(reversed(range(1, diffusion.noise_steps)),
-                  total=diffusion.noise_steps - 1):
-
-        t = torch.tensor([i]).to(DEVICE)
-
-        predicted_noise = unet(
-            x,
-            t,
-            context=context
-        )
-
-        alpha = diffusion.alpha[t][:, None, None, None]
-        alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
-        beta = diffusion.beta[t][:, None, None, None]
-
-        if i > 1:
-            noise = torch.randn_like(x)
-        else:
-            noise = torch.zeros_like(x)
-
-        x = (
-            1 / torch.sqrt(alpha)
-        ) * (
-            x - (
-                (1 - alpha)
-                / torch.sqrt(1 - alpha_hat)
-            ) * predicted_noise
-        ) + torch.sqrt(beta) * noise
-
-        # ====================================================
-        # SAVE INTERMEDIATE STEPS
-        # ====================================================
-
-        if i % 100 == 0:
-
-            latent_preview = x / LATENT_SCALE
-
-            decoded = vae.decode(latent_preview)
-
-            decoded = (decoded.clamp(-1, 1) + 1) / 2
-
-            save_image(
-                decoded,
-                os.path.join(SAVE_DIR, f"step_{i}.png")
-            )
-
-
-print("Denoising completo.")
-
-
-# ============================================================
-# FINAL DECODE
-# ============================================================
-
-with torch.no_grad():
-
-    x = x / LATENT_SCALE
-
-    final_img = vae.decode(x)
-
-    final_img = (final_img.clamp(-1, 1) + 1) / 2
-
-
-save_image(
-    final_img,
-    os.path.join(SAVE_DIR, "resultado_final.png")
-)
-
-print("Imagem salva.")
+print(f"Imagens salvas em: {SAVE_DIR}/geradas.png")

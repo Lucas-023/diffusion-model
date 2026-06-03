@@ -573,3 +573,50 @@ class AttributeEmbedder(nn.Module):
         x = x.permute(0, 2, 1)
 
         return x
+
+
+# =========================================================
+# IDENTITY ADAPTER
+# =========================================================
+
+class IdentityAdapter(nn.Module):
+    """
+    Projects a per-image identity embedding into a sequence of
+    context tokens that can be concatenated with the attribute
+    context before being fed to the UNet cross-attention.
+
+    Output shape [B, context_dim, num_tokens] matches the
+    attribute context shape [B, context_dim, 40] so they can
+    be concatenated along the last dimension.
+    """
+
+    def __init__(
+        self,
+        identity_dim=512,
+        context_dim=512,
+        num_tokens=4
+    ):
+        super().__init__()
+
+        self.num_tokens = num_tokens
+
+        self.proj = nn.Sequential(
+            nn.Linear(identity_dim, context_dim * num_tokens),
+            nn.GELU(),
+            nn.Linear(context_dim * num_tokens, context_dim * num_tokens),
+        )
+
+        self.norm = nn.LayerNorm(context_dim)
+
+    def forward(self, identity_emb):
+        # identity_emb : [B, identity_dim]
+        # returns      : [B, context_dim, num_tokens]
+        B = identity_emb.shape[0]
+
+        tokens = self.proj(identity_emb)
+
+        tokens = tokens.view(B, self.num_tokens, -1)
+
+        tokens = self.norm(tokens)
+
+        return tokens.permute(0, 2, 1)

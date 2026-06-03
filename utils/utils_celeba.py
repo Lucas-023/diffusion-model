@@ -1,6 +1,7 @@
 import os
 import torch
 import torchvision
+import torchvision.transforms as T
 
 from PIL import Image
 
@@ -446,3 +447,258 @@ def get_data(
             test_loader,
             None
         )
+
+
+# ==========================================
+# DATASET: LATENTES + ATRIBUTOS + IMAGEM
+# (para condicionamento de identidade)
+# ==========================================
+
+_IDENTITY_TRANSFORM = T.Compose([
+    T.CenterCrop(178),
+    T.Resize((256, 256)),
+    T.ToTensor(),
+    T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+])
+
+class CelebALatentIdentityDataset(Dataset):
+    """
+    Retorna (latent, attrs, img) onde:
+      - latent : tensor VAE pré-computado [4, H/8, W/8]
+      - attrs  : vetor de atributos binários [40]
+      - img    : imagem original normalizada [3, 256, 256]
+                 usada para encoding de identidade
+    """
+
+    def __init__(
+        self,
+        latent_dir,
+        attr_path,
+        image_dir,
+        transform=None
+    ):
+
+        self.latent_dir = latent_dir
+        self.image_dir = image_dir
+        self.transform = transform or _IDENTITY_TRANSFORM
+
+        # ======================================
+        # SUPORTE PARA .TXT OU .CSV
+        # ======================================
+
+        if attr_path.endswith(".txt"):
+
+            with open(attr_path, "r") as f:
+                lines = f.readlines()
+
+            self.attr_names = lines[1].split()
+
+            self.samples = []
+
+            for line in lines[2:]:
+
+                split = line.strip().split()
+
+                filename = split[0]
+
+                attrs = list(map(int, split[1:]))
+
+                attrs = [(x + 1) // 2 for x in attrs]
+
+                attrs = torch.tensor(attrs, dtype=torch.float32)
+
+                latent_filename = (
+                    filename.split(".")[0] + ".pt"
+                )
+
+                latent_path = os.path.join(
+                    latent_dir, latent_filename
+                )
+
+                if os.path.exists(latent_path):
+                    self.samples.append((filename, latent_filename, attrs))
+
+        else:
+
+            import pandas as pd
+
+            df = pd.read_csv(attr_path)
+
+            self.attr_names = list(df.columns[1:])
+
+            self.samples = []
+
+            for _, row in df.iterrows():
+
+                filename = row.iloc[0]
+
+                attrs = row.iloc[1:].tolist()
+
+                attrs = [1 if x == 1 else 0 for x in attrs]
+
+                attrs = torch.tensor(attrs, dtype=torch.float32)
+
+                latent_filename = (
+                    filename.split(".")[0] + ".pt"
+                )
+
+                latent_path = os.path.join(
+                    latent_dir, latent_filename
+                )
+
+                if os.path.exists(latent_path):
+                    self.samples.append((filename, latent_filename, attrs))
+
+        print("\n===================================")
+        print(f"Dataset (identity) carregado:")
+        print(f"Amostras encontradas: {len(self.samples)}")
+        print(f"Número de atributos: {len(self.attr_names)}")
+        print("===================================\n")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+
+        img_filename, latent_filename, _ = self.samples[idx]
+
+        latent_path = os.path.join(
+            self.latent_dir, latent_filename
+        )
+
+        data = torch.load(latent_path, map_location="cpu")
+
+        latent = data["latent"]
+        attrs = data["attrs"]
+
+        img_path = os.path.join(self.image_dir, img_filename)
+
+        img = Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+
+        return latent, attrs, img
+
+
+# ==========================================
+# DATALOADER COM IDENTIDADE
+# ==========================================
+
+def get_data_identity(args, is_distributed=True):
+
+    latent_dir = "./cache_latent"
+
+    image_dir = (
+        "./CelebA_data/celeba/"
+        "img_align_celeba/img_align_celeba"
+    )
+
+    txt_path = (
+        "./CelebA_data/celeba/list_attr_celeba.txt"
+    )
+
+    csv_path = (
+        "./CelebA_data/celeba/list_attr_celeba.csv"
+    )
+
+    if os.path.exists(txt_path):
+        attr_path = txt_path
+    elif os.path.exists(csv_path):
+        attr_path = csv_path
+    else:
+        raise FileNotFoundError(
+            "Nenhum arquivo de atributos encontrado."
+        )
+
+    dataset = CelebALatentIdentityDataset(
+        latent_dir=latent_dir,
+        attr_path=attr_path,
+        image_dir=image_dir,
+    )
+
+    train_size = int(0.70 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+
+    train_dataset, val_dataset, test_dataset = \
+        torch.utils.data.random_split(
+            dataset,
+            [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+    print("\n===================================")
+    print("DATASET SPLITS")
+    print(f"Train: {len(train_dataset)}")
+    print(f"Val:   {len(val_dataset)}")
+    print(f"Test:  {len(test_dataset)}")
+    print("===================================\n")
+
+    loader_kwargs = dict(
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    if is_distributed:
+
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        test_sampler = DistributedSampler(test_dataset, shuffle=False)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=False,
+            drop_last=True,
+            **loader_kwargs,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            sampler=test_sampler,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        return train_loader, val_loader, test_loader, train_sampler
+
+    else:
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        return train_loader, val_loader, test_loader, None
