@@ -1,30 +1,17 @@
-# 1. Ignora tudo por padrão
+# Ignora tudo por padrão
 *
 
-# 2. Permite que o Git navegue pelas pastas básicas do projeto
+# Permite que o Git navegue pelas pastas
 !*/
-!results/
-!results/*/
 
-# 3. PERMISSÕES: O que PODE subir para o GitHub
+# Apenas arquivos .py sobem
 !*.py
-!results/**/*.png
-!results/**/*.jpg
-!results/**/*.jpeg
 
-# 4. BLOQUEIOS: O que NÃO PODE subir de jeito nenhum
-# Ignora pastas de dados/datasets (ajuste o nome se a sua pasta for diferente)
-data/
-dataset/
-celeba/
-
-# Ignora ambientes virtuais e cache
+# Bloqueia explicitamente o que não deve subir nunca
+__pycache__/
 .venv/
 venv/
 env/
-__pycache__/
-
-# Ignora pesos do modelo (arquivos muito pesados)
 *.pt
 *.pth
 *.ckpt
