@@ -431,11 +431,11 @@ def train(args):
     if is_master:
         from PIL import Image as PILImage
 
-        train_base = train_dataset.dataset          # CelebALatentIdentityDataset
+        train_base = train_loader.dataset.dataset    # CelebALatentIdentityDataset
 
         samples_fixed = []
-        for _i in range(min(16, len(train_dataset))):
-            real_idx = train_dataset.indices[_i]
+        for _i in range(min(16, len(train_loader.dataset))):
+            real_idx = train_loader.dataset.indices[_i]
             _, _attrs, _identity = train_base[real_idx]
 
             _fname = train_base.samples[real_idx][0]
