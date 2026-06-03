@@ -112,8 +112,11 @@ def build_context(
     """
 
     attr_ctx = attribute_embedder(attrs)                        # [B, 512, 40]
-    identity_emb = identity_emb.to(dtype=attr_ctx.dtype)       # alinha dtype (float16 sob autocast)
-    id_tokens = identity_adapter(identity_emb)                 # [B, 512, num_tokens]
+    # IdentityAdapter roda em float32 — cuBLASLt CUDA 13.0 + PyTorch cu118
+    # não suporta certos algoritmos float16 nessa combinação
+    with torch.amp.autocast("cuda", enabled=False):
+        id_tokens = identity_adapter(identity_emb.float())     # [B, 512, num_tokens]
+    id_tokens = id_tokens.to(dtype=attr_ctx.dtype)             # volta para o dtype do contexto
 
     if training:
 
