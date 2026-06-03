@@ -425,6 +425,39 @@ def train(args):
     fixed_id_data = None
 
     # =====================================================
+    # FIXED SAMPLES + ORIGINAIS (master only, uma vez)
+    # =====================================================
+
+    if is_master:
+        from PIL import Image as PILImage
+
+        train_base = train_dataset.dataset          # CelebALatentIdentityDataset
+
+        samples_fixed = []
+        for _i in range(min(16, len(train_dataset))):
+            real_idx = train_dataset.indices[_i]
+            _, _attrs, _identity = train_base[real_idx]
+
+            _fname = train_base.samples[real_idx][0]
+            _img = PILImage.open(
+                os.path.join(train_base.image_dir, _fname)
+            ).convert("RGB")
+            _orig = train_base.transform(_img)
+
+            samples_fixed.append((_attrs, _identity, _orig))
+
+        fixed_attrs   = torch.stack([s[0] for s in samples_fixed]).to(device)
+        fixed_id_data = torch.stack([s[1] for s in samples_fixed]).to(device)
+        orig_imgs     = torch.stack([s[2] for s in samples_fixed])
+
+        save_images(
+            orig_imgs,
+            os.path.join(results_dir, "originals.jpg"),
+            nrow=4
+        )
+        print("Originais salvas em originals.jpg")
+
+    # =====================================================
     # TRAIN LOOP
     # =====================================================
 
@@ -447,10 +480,6 @@ def train(args):
             latents = latents.to(device, non_blocking=True)
             attrs = attrs.to(device, non_blocking=True)
             id_data = id_data.to(device, non_blocking=True)
-
-            if is_master and fixed_attrs is None:
-                fixed_attrs = attrs[:16].clone()
-                fixed_id_data = id_data[:16].clone()
 
             # =============================================
             # TIMESTEPS
