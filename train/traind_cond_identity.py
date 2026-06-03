@@ -47,6 +47,14 @@ import contextlib
 
 def setup_ddp():
 
+    # Permite rodar com `python` direto (1 GPU) sem torchrun
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+
     dist.init_process_group(backend="nccl")
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -141,7 +149,7 @@ def train(args):
     # DATA
     # =====================================================
 
-    train_loader, val_loader, _, train_sampler = get_data_identity(
+    train_loader, val_loader, _, train_sampler, use_arcface_cache = get_data_identity(
         args,
         is_distributed=True
     )
@@ -410,7 +418,7 @@ def train(args):
     os.makedirs(results_dir, exist_ok=True)
 
     fixed_attrs = None
-    fixed_imgs = None
+    fixed_id_data = None
 
     # =====================================================
     # TRAIN LOOP
@@ -430,15 +438,15 @@ def train(args):
 
         optimizer.zero_grad(set_to_none=True)
 
-        for i, (latents, attrs, images) in enumerate(pbar):
+        for i, (latents, attrs, id_data) in enumerate(pbar):
 
             latents = latents.to(device, non_blocking=True)
             attrs = attrs.to(device, non_blocking=True)
-            images = images.to(device, non_blocking=True)
+            id_data = id_data.to(device, non_blocking=True)
 
             if is_master and fixed_attrs is None:
                 fixed_attrs = attrs[:16].clone()
-                fixed_imgs = images[:16].clone()
+                fixed_id_data = id_data[:16].clone()
 
             # =============================================
             # TIMESTEPS
@@ -480,11 +488,14 @@ def train(args):
                 with autocast():
 
                     # =====================================
-                    # IDENTITY EMBEDDING (sem gradiente)
+                    # IDENTITY EMBEDDING
                     # =====================================
 
-                    with torch.no_grad():
-                        identity_emb = identity_encoder(images)
+                    if use_arcface_cache:
+                        identity_emb = id_data   # [B, 512] do cache
+                    else:
+                        with torch.no_grad():
+                            identity_emb = identity_encoder(id_data)
 
                     # =====================================
                     # COMBINED CONTEXT
@@ -569,15 +580,18 @@ def train(args):
 
         with torch.no_grad():
 
-            for latents, attrs, images in val_loader:
+            for latents, attrs, id_data in val_loader:
 
                 latents = latents.to(device, non_blocking=True)
                 attrs = attrs.to(device, non_blocking=True)
-                images = images.to(device, non_blocking=True)
+                id_data = id_data.to(device, non_blocking=True)
 
                 with autocast():
 
-                    identity_emb = identity_encoder(images)
+                    if use_arcface_cache:
+                        identity_emb = id_data
+                    else:
+                        identity_emb = identity_encoder(id_data)
 
                     context = build_context(
                         attribute_embedder,
@@ -686,9 +700,10 @@ def train(args):
 
             with torch.no_grad():
 
-                identity_emb = identity_encoder(
-                    fixed_imgs.to(device)
-                )
+                if use_arcface_cache:
+                    identity_emb = fixed_id_data.to(device)
+                else:
+                    identity_emb = identity_encoder(fixed_id_data.to(device))
 
                 context_test = build_context(
                     ema_embedder,

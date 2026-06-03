@@ -463,11 +463,9 @@ _IDENTITY_TRANSFORM = T.Compose([
 
 class CelebALatentIdentityDataset(Dataset):
     """
-    Retorna (latent, attrs, img) onde:
-      - latent : tensor VAE pré-computado [4, H/8, W/8]
-      - attrs  : vetor de atributos binários [40]
-      - img    : imagem original normalizada [3, 256, 256]
-                 usada para encoding de identidade
+    Retorna (latent, attrs, identity) onde identity é:
+      - tensor [512]        se arcface_dir for fornecido (cache pré-computado)
+      - tensor [3, 256, 256] caso contrário (imagem original para encoding em tempo real)
     """
 
     def __init__(
@@ -475,11 +473,13 @@ class CelebALatentIdentityDataset(Dataset):
         latent_dir,
         attr_path,
         image_dir,
+        arcface_dir=None,
         transform=None
     ):
 
         self.latent_dir = latent_dir
         self.image_dir = image_dir
+        self.arcface_dir = arcface_dir
         self.transform = transform or _IDENTITY_TRANSFORM
 
         # ======================================
@@ -571,12 +571,16 @@ class CelebALatentIdentityDataset(Dataset):
         latent = data["latent"]
         attrs = data["attrs"]
 
-        img_path = os.path.join(self.image_dir, img_filename)
+        if self.arcface_dir is not None:
+            stem = os.path.splitext(img_filename)[0]
+            emb_path = os.path.join(self.arcface_dir, stem + ".pt")
+            identity = torch.load(emb_path, map_location="cpu")   # [512]
+        else:
+            img_path = os.path.join(self.image_dir, img_filename)
+            img = Image.open(img_path).convert("RGB")
+            identity = self.transform(img)                         # [3, 256, 256]
 
-        img = Image.open(img_path).convert("RGB")
-        img = self.transform(img)
-
-        return latent, attrs, img
+        return latent, attrs, identity
 
 
 # ==========================================
@@ -609,10 +613,18 @@ def get_data_identity(args, is_distributed=True):
             "Nenhum arquivo de atributos encontrado."
         )
 
+    arcface_dir = "./cache_arcface"
+    if not os.path.isdir(arcface_dir):
+        arcface_dir = None
+        print("Cache ArcFace nao encontrado — imagens carregadas em tempo real.")
+    else:
+        print(f"Cache ArcFace detectado: {arcface_dir}")
+
     dataset = CelebALatentIdentityDataset(
         latent_dir=latent_dir,
         attr_path=attr_path,
         image_dir=image_dir,
+        arcface_dir=arcface_dir,
     )
 
     train_size = int(0.70 * len(dataset))
@@ -673,7 +685,7 @@ def get_data_identity(args, is_distributed=True):
             **loader_kwargs,
         )
 
-        return train_loader, val_loader, test_loader, train_sampler
+        return train_loader, val_loader, test_loader, train_sampler, arcface_dir is not None
 
     else:
 
@@ -701,4 +713,4 @@ def get_data_identity(args, is_distributed=True):
             **loader_kwargs,
         )
 
-        return train_loader, val_loader, test_loader, None
+        return train_loader, val_loader, test_loader, None, arcface_dir is not None
