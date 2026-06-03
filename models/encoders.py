@@ -146,6 +146,12 @@ class ArcFaceEncoder(nn.Module):
         if self._rec is not None:
             return
         from insightface.model_zoo import get_model
+        if not os.path.exists(self._model_path):
+            from insightface.app import FaceAnalysis
+            print("Baixando modelo ArcFace (buffalo_l)...")
+            app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+            app.prepare(ctx_id=-1)
+            del app
         self._rec = get_model(
             self._model_path,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
