@@ -368,10 +368,21 @@ def train(args):
             checkpoint["optimizer_state_dict"]
         )
 
-        start_epoch = checkpoint["epoch"] + 1
+        start_epoch = args.start_epoch if args.start_epoch is not None else checkpoint["epoch"] + 1
+
+        if "scheduler_state_dict" in checkpoint and args.start_epoch is None:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            for _ in range(start_epoch):
+                scheduler.step()
+
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         if is_master:
-            print(f"Retomando da epoca {start_epoch}")
+            if "global_step" in checkpoint:
+                global_step = checkpoint["global_step"]
+            print(f"Retomando da epoca {start_epoch} | LR atual: {optimizer.param_groups[0]['lr']:.2e}")
 
     # =====================================================
     # WARM START (checkpoint de atributos sem identidade)
@@ -408,8 +419,13 @@ def train(args):
             checkpoint.get("ema_embedder_state_dict", checkpoint["attribute_embedder_state_dict"])
         )
 
+        if args.start_epoch is not None:
+            start_epoch = args.start_epoch
+            for _ in range(start_epoch):
+                scheduler.step()
+
         if is_master:
-            print("UNet e AttributeEmbedder carregados. IdentityAdapter inicializado do zero.")
+            print(f"UNet e AttributeEmbedder carregados. IdentityAdapter inicializado do zero. Iniciando da epoch {start_epoch} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
     # =====================================================
     # DIRS
@@ -469,7 +485,7 @@ def train(args):
         attribute_embedder.train()
         identity_adapter.train()
 
-        pbar = tqdm(train_loader) if is_master else train_loader
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs - 1}") if is_master else train_loader
 
         epoch_losses = []
 
@@ -699,6 +715,7 @@ def train(args):
 
             checkpoint = {
                 "epoch": epoch,
+                "global_step": global_step,
                 "model_state_dict": model.module.state_dict(),
                 "attribute_embedder_state_dict": attribute_embedder.module.state_dict(),
                 "identity_adapter_state_dict": identity_adapter.module.state_dict(),
@@ -706,6 +723,8 @@ def train(args):
                 "ema_embedder_state_dict": ema_embedder.state_dict(),
                 "ema_id_adapter_state_dict": ema_id_adapter.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "val_loss": avg_val_loss,
             }
 
@@ -832,6 +851,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Inicia de checkpoint de atributos sem identidade. Carrega UNet + AttributeEmbedder; IdentityAdapter começa do zero."
+    )
+
+    parser.add_argument(
+        "--start_epoch",
+        type=int,
+        default=None,
+        help="Força o início da epoch N, posicionando o scheduler corretamente (útil para checkpoints antigos sem scheduler_state_dict)."
     )
 
     parser.add_argument(
