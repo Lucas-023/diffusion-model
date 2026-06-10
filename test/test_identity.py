@@ -16,7 +16,7 @@ Exemplos
 --------
   # Lê atributos do CelebA e ativa sorriso:
   python test/test_identity.py \
-      --ref  CelebA_data/celeba/img_align_celeba/000001.jpg \
+      --ref  CelebA_data/celeba/img_align_celeba/img_align_celeba/000001.jpg \
       --ckpt models/LDM_Identity_Conditional/ckpt_best.pt \
       --enable Smiling
 
@@ -373,7 +373,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--celeba_attrs_file",
         type=str,
-        default="CelebA_data/celeba/list_attr_celeba.txt",
+        default="CelebA_data/celeba/list_attr_celeba.csv",
         help="Arquivo de anotações CelebA (.txt oficial ou .csv do Kaggle). "
              "Usado quando --manual_attrs não é fornecido.",
     )
