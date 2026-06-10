@@ -714,3 +714,128 @@ def get_data_identity(args, is_distributed=True):
         )
 
         return train_loader, val_loader, test_loader, None, arcface_dir is not None
+
+
+# ==========================================
+# DATALOADER PARA CONDICIONAMENTO POR IMAGEM
+# Sempre carrega imagens brutas (nunca cache ArcFace).
+# ==========================================
+
+def get_data_imagecond(args, is_distributed=True):
+    """
+    Igual a get_data_identity mas força arcface_dir=None.
+    Cada sample retorna (latent, attrs, ref_img) onde
+    ref_img é [3, 256, 256] em [-1, 1].
+    """
+
+    latent_dir = "./cache_latent"
+
+    image_dir = (
+        "./CelebA_data/celeba/"
+        "img_align_celeba/img_align_celeba"
+    )
+
+    txt_path = "./CelebA_data/celeba/list_attr_celeba.txt"
+    csv_path = "./CelebA_data/celeba/list_attr_celeba.csv"
+
+    if os.path.exists(txt_path):
+        attr_path = txt_path
+    elif os.path.exists(csv_path):
+        attr_path = csv_path
+    else:
+        raise FileNotFoundError("Nenhum arquivo de atributos encontrado.")
+
+    dataset = CelebALatentIdentityDataset(
+        latent_dir=latent_dir,
+        attr_path=attr_path,
+        image_dir=image_dir,
+        arcface_dir=None,   # sempre imagem bruta
+    )
+
+    train_size = int(0.70 * len(dataset))
+    val_size   = int(0.15 * len(dataset))
+    test_size  = len(dataset) - train_size - val_size
+
+    train_dataset, val_dataset, test_dataset = \
+        torch.utils.data.random_split(
+            dataset,
+            [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+
+    print("\n===================================")
+    print("DATASET SPLITS (ImageCond)")
+    print(f"Train: {len(train_dataset)}")
+    print(f"Val:   {len(val_dataset)}")
+    print(f"Test:  {len(test_dataset)}")
+    print("===================================\n")
+
+    loader_kwargs = dict(
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    if is_distributed:
+
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler   = DistributedSampler(val_dataset,   shuffle=False)
+        test_sampler  = DistributedSampler(test_dataset,  shuffle=False)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=False,
+            drop_last=True,
+            **loader_kwargs,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            sampler=test_sampler,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        return train_loader, val_loader, test_loader, train_sampler
+
+    else:
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
+
+        return train_loader, val_loader, test_loader, None

@@ -322,6 +322,7 @@ def train(args):
     accumulation_steps = 4
 
     start_epoch = 0
+    best_val_loss = float("inf")
 
     # =====================================================
     # RESUME
@@ -382,7 +383,9 @@ def train(args):
         if is_master:
             if "global_step" in checkpoint:
                 global_step = checkpoint["global_step"]
-            print(f"Retomando da epoca {start_epoch} | LR atual: {optimizer.param_groups[0]['lr']:.2e}")
+            if "best_val_loss" in checkpoint:
+                best_val_loss = checkpoint["best_val_loss"]
+            print(f"Retomando da epoca {start_epoch} | LR atual: {optimizer.param_groups[0]['lr']:.2e} | Melhor val loss: {best_val_loss:.6f}")
 
     # =====================================================
     # WARM START (checkpoint de atributos sem identidade)
@@ -708,32 +711,38 @@ def train(args):
         # CHECKPOINT
         # =================================================
 
-        if is_master and (
-            epoch % 10 == 0
-            or epoch == args.epochs - 1
-        ):
+        if is_master:
 
-            checkpoint = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "model_state_dict": model.module.state_dict(),
-                "attribute_embedder_state_dict": attribute_embedder.module.state_dict(),
-                "identity_adapter_state_dict": identity_adapter.module.state_dict(),
-                "ema_state_dict": ema_model.state_dict(),
-                "ema_embedder_state_dict": ema_embedder.state_dict(),
-                "ema_id_adapter_state_dict": ema_id_adapter.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "val_loss": avg_val_loss,
-            }
+            save_periodic = (epoch % 10 == 0 or epoch == args.epochs - 1)
+            save_best     = (avg_val_loss < best_val_loss)
 
-            torch.save(
-                checkpoint,
-                os.path.join(save_dir, "ckpt.pt")
-            )
+            if save_periodic or save_best:
 
-            print("Checkpoint salvo.")
+                checkpoint = {
+                    "epoch":                          epoch,
+                    "global_step":                    global_step,
+                    "model_state_dict":               model.module.state_dict(),
+                    "attribute_embedder_state_dict":  attribute_embedder.module.state_dict(),
+                    "identity_adapter_state_dict":    identity_adapter.module.state_dict(),
+                    "ema_state_dict":                 ema_model.state_dict(),
+                    "ema_embedder_state_dict":        ema_embedder.state_dict(),
+                    "ema_id_adapter_state_dict":      ema_id_adapter.state_dict(),
+                    "optimizer_state_dict":           optimizer.state_dict(),
+                    "scheduler_state_dict":           scheduler.state_dict(),
+                    "scaler_state_dict":              scaler.state_dict(),
+                    "val_loss":                       avg_val_loss,
+                    "best_val_loss":                  best_val_loss,
+                }
+
+                if save_periodic:
+                    torch.save(checkpoint, os.path.join(save_dir, "ckpt.pt"))
+                    print("Checkpoint salvo.")
+
+                if save_best:
+                    best_val_loss = avg_val_loss
+                    checkpoint["best_val_loss"] = best_val_loss
+                    torch.save(checkpoint, os.path.join(save_dir, "ckpt_best.pt"))
+                    print(f"Novo melhor val loss: {best_val_loss:.6f} → ckpt_best.pt salvo.")
 
         # =================================================
         # SAMPLE

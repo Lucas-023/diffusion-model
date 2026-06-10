@@ -183,3 +183,99 @@ class ArcFaceEncoder(nn.Module):
 
         emb = torch.from_numpy(feat.copy()).to(device)
         return F.normalize(emb.float(), dim=-1)
+
+
+# =========================================================
+# IMAGE CONDITION ENCODER  (IP-Adapter style, sem ArcFace)
+# =========================================================
+
+class ImageConditionEncoder(nn.Module):
+    """
+    Extrai tokens espaciais de identidade de uma imagem de referência.
+
+    Arquitetura: ResNet-18 (ImageNet, frozen até layer3) + projeção treinável.
+
+    Fluxo de tensores
+    -----------------
+    ref_img  [B, 3, H, W]  em [-1, 1]
+        → renorm ImageNet
+        → backbone (conv1..layer3)  → [B, 256, H/16, W/16]
+        → AdaptiveAvgPool2d(side, side) → [B, 256, side, side]
+        → flatten                   → [B, 256, num_tokens]
+        → permute                   → [B, num_tokens, 256]
+        → LayerNorm + Linear + GELU + Linear → [B, num_tokens, context_dim]
+        → permute                   → [B, context_dim, num_tokens]  ← formato do contexto
+
+    Para 256×256 e num_tokens=16 (side=4):
+        backbone produz [B, 256, 16, 16] → pool → [B, 256, 4, 4] → 16 tokens
+    """
+
+    def __init__(
+        self,
+        context_dim: int = 512,
+        num_tokens: int = 16,
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+
+        import math
+        side = int(math.isqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"num_tokens={num_tokens} deve ser quadrado perfeito (ex: 4, 9, 16, 25)")
+
+        backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+
+        # layer3 de ResNet-18: 256 canais, stride acumulado 16
+        self.backbone = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+            backbone.layer1,
+            backbone.layer2,
+            backbone.layer3,
+        )
+        feat_dim = 256  # canais de saída do layer3 do ResNet-18
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.pool = nn.AdaptiveAvgPool2d((side, side))
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, context_dim),
+            nn.GELU(),
+            nn.Linear(context_dim, context_dim),
+        )
+
+        self.num_tokens = num_tokens
+
+        # Normalização ImageNet registrada como buffer (move com .to(device))
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def forward(self, ref_img: torch.Tensor) -> torch.Tensor:
+        """
+        ref_img: [B, 3, H, W] float em [-1, 1]
+        retorna: [B, context_dim, num_tokens]
+        """
+        # [-1, 1] → [0, 1] → normalização ImageNet
+        x = ref_img.float() * 0.5 + 0.5
+        x = (x - self.imagenet_mean) / self.imagenet_std
+
+        feats = self.backbone(x)           # [B, 256, H/16, W/16]
+        feats = self.pool(feats)            # [B, 256, side, side]
+        feats = feats.flatten(2)            # [B, 256, num_tokens]
+        feats = feats.permute(0, 2, 1)     # [B, num_tokens, 256]
+
+        tokens = self.proj(feats)           # [B, num_tokens, context_dim]
+
+        return tokens.permute(0, 2, 1)     # [B, context_dim, num_tokens]
