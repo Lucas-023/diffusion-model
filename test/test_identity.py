@@ -7,16 +7,16 @@ Fluxo
 -----
 1. Carrega foto de referência.
 2. Extrai embedding de identidade via ArcFaceEncoder.
-3. Obtém atributos da referência via AttributePredictor (ou manualmente).
+3. Obtém atributos do arquivo de anotações CelebA (ou manualmente).
 4. Aplica edições de atributos (--enable / --disable).
 5. Gera N imagens com DDPM + CFG.
 6. Salva grid com referência + imagens geradas.
 
 Exemplos
 --------
-  # Detecta atributos automaticamente e ativa sorriso:
+  # Lê atributos do CelebA e ativa sorriso:
   python test/test_identity.py \
-      --ref  foto.jpg \
+      --ref  CelebA_data/celeba/img_align_celeba/000001.jpg \
       --ckpt models/LDM_Identity_Conditional/ckpt_best.pt \
       --enable Smiling
 
@@ -46,7 +46,7 @@ from PIL import Image
 
 from models.unet_conditional import UNet_cond
 from models.modules import AttributeEmbedder, IdentityAdapter
-from models.encoders import ArcFaceEncoder, AttributePredictor
+from models.encoders import ArcFaceEncoder
 from vae.modules import VAE
 from diffusion.conditional_ddpm import Diffusion_conditional
 
@@ -89,6 +89,36 @@ TRANSFORM = T.Compose([
 def load_image(path):
     img = Image.open(path).convert("RGB")
     return TRANSFORM(img).unsqueeze(0)   # [1, 3, 256, 256]
+
+
+def load_celeba_attrs(image_path, attrs_file):
+    """Lê os atributos de uma imagem CelebA do arquivo de anotações.
+
+    Suporta o formato TXT oficial (list_attr_celeba.txt) e CSV do Kaggle.
+    O nome da imagem é extraído do basename de image_path.
+    """
+    image_name = os.path.basename(image_path)
+
+    if attrs_file.endswith(".txt"):
+        with open(attrs_file, "r") as f:
+            lines = f.readlines()
+        # linha 0: num imagens; linha 1: nomes dos atributos; linha 2+: dados
+        for line in lines[2:]:
+            parts = line.strip().split()
+            if parts[0] == image_name:
+                # valores em {-1, 1} → {0, 1}
+                vals = [(int(x) + 1) // 2 for x in parts[1:]]
+                return torch.tensor(vals, dtype=torch.float32)
+        raise ValueError(f"Imagem '{image_name}' não encontrada em {attrs_file}")
+
+    else:  # CSV do Kaggle
+        import pandas as pd
+        df = pd.read_csv(attrs_file)
+        row = df[df.iloc[:, 0] == image_name]
+        if row.empty:
+            raise ValueError(f"Imagem '{image_name}' não encontrada em {attrs_file}")
+        vals = [(int(x) + 1) // 2 for x in row.iloc[0, 1:].tolist()]
+        return torch.tensor(vals, dtype=torch.float32)
 
 
 def resolve_ckpt(args):
@@ -218,23 +248,9 @@ def generate(args):
         print("Modo manual: atributos definidos pelo usuário.")
 
     else:
-        attr_predictor = AttributePredictor(
-            num_attributes=40,
-            pretrained_path=args.attr_predictor_ckpt,
-        ).to(device)
-        attr_predictor.eval()
-
-        if args.attr_predictor_ckpt is None:
-            print(
-                "[AVISO] --attr_predictor_ckpt não informado. "
-                "Usando ResNet-50 com pesos ImageNet — predição pode ser imprecisa."
-            )
-
-        with torch.no_grad():
-            attrs_vec = attr_predictor.predict(ref_img).squeeze(0).cpu()
-
+        attrs_vec = load_celeba_attrs(args.ref, args.celeba_attrs_file)
         detected = [CELEBA_ATTRS[i] for i in range(40) if attrs_vec[i] == 1.0]
-        print(f"Atributos detectados: {detected}")
+        print(f"Atributos CelebA: {detected}")
 
     # ----------------------------------------------------------
     # EDIÇÕES
@@ -355,11 +371,11 @@ if __name__ == "__main__":
 
     # Atributos
     parser.add_argument(
-        "--attr_predictor_ckpt",
+        "--celeba_attrs_file",
         type=str,
-        default=None,
-        help="Checkpoint do AttributePredictor treinado no CelebA. "
-             "Sem isso usa ResNet-50 ImageNet (impreciso).",
+        default="CelebA_data/celeba/list_attr_celeba.txt",
+        help="Arquivo de anotações CelebA (.txt oficial ou .csv do Kaggle). "
+             "Usado quando --manual_attrs não é fornecido.",
     )
     parser.add_argument(
         "--manual_attrs",
