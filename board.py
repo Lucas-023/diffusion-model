@@ -18,6 +18,9 @@ class Board:
     def log_scalar(self, tag, value, step):
         if self.writer: self.writer.add_scalar(tag, value, step)
 
+    def log_scalars(self, tag, value_dict, step):
+        if self.writer: self.writer.add_scalars(tag, value_dict, step)
+
     def log_image(self, tag, image, step):
         if self.writer: self.writer.add_image(tag, image, step)
 
