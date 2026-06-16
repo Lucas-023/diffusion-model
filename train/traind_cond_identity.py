@@ -703,8 +703,7 @@ def train(args):
                 f" | LR: {current_lr:.6f}"
             )
 
-            board.log_scalar("Metrics/Loss_Epoch", avg_loss, epoch)
-            board.log_scalar("Metrics/Val_Loss", avg_val_loss, epoch)
+            board.log_scalars("Loss/Epoch", {"train": avg_loss, "val": avg_val_loss}, epoch)
             board.log_scalar("Metrics/Learning_Rate", current_lr, epoch)
 
         # =================================================

@@ -620,3 +620,61 @@ class IdentityAdapter(nn.Module):
         tokens = self.norm(tokens)
 
         return tokens.permute(0, 2, 1)
+
+
+# =========================================================
+# NOISY LATENT ATTRIBUTE CLASSIFIER
+# =========================================================
+
+class NoisyLatentAttrClassifier(nn.Module):
+    """
+    Prediz os 40 atributos CelebA a partir de latentes ruidosos z_t e timestep t.
+    Treinado com BCEWithLogitsLoss nos latentes com ruído artificial durante o
+    treino do diffusion model.
+
+    Usado para Classifier Guidance na inferência:
+        grad_zt = grad(sum(log_sigmoid(logits * (2*y - 1))), z_t)
+        eps_guided = eps - guidance_scale * sqrt(1 - alpha_hat_t) * grad_zt
+
+    Input:  z_t [B, latent_dim, H, W]  latente com ruído
+            t   [B]                     timestep inteiro
+    Output: logits [B, num_attrs]       sem sigmoid (raw)
+    """
+
+    def __init__(self, latent_dim=4, time_emb_dim=256, num_attrs=40):
+        super().__init__()
+
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
+        )
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(latent_dim, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),    # 16x16
+            nn.GroupNorm(16, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),   # 8x8
+            nn.GroupNorm(32, 256),
+            nn.SiLU(),
+            nn.Conv2d(256, 512, 3, stride=2, padding=1),   # 4x4
+            nn.GroupNorm(32, 512),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(512 + time_emb_dim, 512),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, num_attrs),
+        )
+
+    def forward(self, z_t, t):
+        t_emb = self.time_embed(t.float())              # [B, time_emb_dim]
+        feats = self.conv(z_t).squeeze(-1).squeeze(-1)  # [B, 512]
+        return self.head(torch.cat([feats, t_emb], dim=-1))  # [B, num_attrs]

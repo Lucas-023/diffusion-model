@@ -1,11 +1,41 @@
 # diffusion-model
 
+Latent Diffusion Model condicional treinado no CelebA, com suporte a condicionamento por **atributos faciais** (40 atributos binários) e **identidade visual** (ArcFace).
+
+## Instalação
+
+```bash
+# PyTorch com CUDA 11.8
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+# Dependências gerais
+pip install tqdm matplotlib pillow tensorboard
 
-pip install tqdm matplotlib pillow types-python-dateutil tensorboard
+# ArcFace (InsightFace)
+pip install insightface onnxruntime-gpu
+```
 
-ddpm with 32x32 images:
-🎉 FID Score: 3.35
+## Uso rápido
 
+```bash
+# Gerar a mesma pessoa com atributos editados
+python generate_from_ref.py \
+    --ref_image foto.jpg \
+    --ckpt models/LDM_Identity_v1/ckpt.pt \
+    --enable Smiling Eyeglasses \
+    --disable Bald
+
+# Treino multi-GPU (atributos + identidade)
+torchrun --nproc_per_node=4 train/traind_cond_identity.py \
+    --run_name LDM_Identity_v1 \
+    --epochs 2000 \
+    --batch_size 64
+```
+
+## Documentação completa
+
+Ver [DIFFUSION_IDENTIDADE.md](DIFFUSION_IDENTIDADE.md) para arquitetura detalhada, fluxos de dados e guia de uso completo.
+
+## Resultados
+
+DDPM 32×32 — FID Score: **3.35**
