@@ -30,11 +30,14 @@ Atributos manuais (ignora a imagem para atributos):
 """
 
 import os
+import math
 import argparse
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.models as tv_models
 from torchvision.utils import save_image
 from PIL import Image
 from tqdm import tqdm
@@ -44,6 +47,67 @@ from models.encoders import ImageConditionEncoder, AttributePredictor
 from models.modules import NoisyLatentAttrClassifier
 from diffusion.conditional_ddpm import Diffusion_conditional
 from vae.modules import VAE
+
+
+# ============================================================
+# LEGACY ENCODER  (ResNet-18, checkpoints antes do CLIP+ArcFace)
+# ============================================================
+
+class _LegacyImageConditionEncoder(nn.Module):
+    """ResNet-18 encoder used before the CLIP+ArcFace switch."""
+
+    def __init__(self, context_dim=512, num_tokens=16, freeze_backbone=True):
+        super().__init__()
+
+        side = int(math.isqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"num_tokens={num_tokens} deve ser quadrado perfeito")
+
+        backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+        self.backbone = nn.Sequential(
+            backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
+            backbone.layer1, backbone.layer2, backbone.layer3,
+        )
+        feat_dim = 256
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.pool = nn.AdaptiveAvgPool2d((side, side))
+        self.proj = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, context_dim),
+            nn.GELU(),
+            nn.Linear(context_dim, context_dim),
+        )
+        self.num_tokens = num_tokens
+
+        self.register_buffer(
+            "imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "imagenet_std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+    def forward(self, ref_img):
+        x = ref_img.float() * 0.5 + 0.5
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        feats = self.backbone(x)
+        feats = self.pool(feats).flatten(2).permute(0, 2, 1)
+        return self.proj(feats).permute(0, 2, 1)   # [B, context_dim, num_tokens]
+
+
+# ============================================================
+# ENCODER TYPE DETECTION
+# ============================================================
+
+def _detect_encoder_type(enc_state_dict):
+    """Returns 'clip_arcface' for new encoder, 'resnet' for legacy."""
+    for k in enc_state_dict:
+        if k.startswith("clip."):
+            return "clip_arcface"
+    return "resnet"
 
 
 # ============================================================
@@ -96,7 +160,7 @@ def _unet_forward(unet, z_t, t, context):
 
 def sample_hybrid(
     unet,
-    classifier,
+    classifier,           # NoisyLatentAttrClassifier ou None (desativa CG)
     diffusion,
     img_context,          # [N, 512, num_img_tokens]  tokens da imagem condicionada
     attrs,                # [N, 40]  atributos alvo (float)
@@ -114,7 +178,8 @@ def sample_hybrid(
     """
 
     unet.eval()
-    classifier.eval()
+    if classifier is not None:
+        classifier.eval()
 
     img_size = diffusion.img_size
 
@@ -141,10 +206,11 @@ def sample_hybrid(
 
         # ------------------------------------------------
         # 2. Classifier Guidance para atributos
-        #    Ativo quando cg_scale_attr > 0 e i <= cg_t_thresh
+        #    Ativo quando classifier não é None, cg_scale_attr > 0 e i <= cg_t_thresh
         # ------------------------------------------------
         apply_cg = (
-            cg_scale_attr > 0.0
+            classifier is not None
+            and cg_scale_attr > 0.0
             and (cg_t_thresh is None or i <= cg_t_thresh)
         )
 
@@ -228,34 +294,55 @@ def generate(args):
     unet.eval()
 
     # ========================================================
-    # IMAGE CONDITION ENCODER
+    # IMAGE CONDITION ENCODER  (auto-detects old vs new)
     # ========================================================
 
-    image_encoder = ImageConditionEncoder(
-        context_dim=512,
-        num_tokens=num_img_tokens,
-        freeze_backbone=True,
-    ).to(device)
+    enc_sd   = ckpt.get("ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"])
+    enc_type = _detect_encoder_type(enc_sd)
 
-    image_encoder.load_state_dict(
-        ckpt.get("ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"])
-    )
+    if enc_type == "clip_arcface":
+        print("  encoder: CLIP + ArcFace (novo)")
+        image_encoder = ImageConditionEncoder(
+            context_dim=512,
+            num_tokens=num_img_tokens,
+            freeze_backbone=True,
+        ).to(device)
+    else:
+        print("  encoder: ResNet-18 (legado)")
+        image_encoder = _LegacyImageConditionEncoder(
+            context_dim=512,
+            num_tokens=num_img_tokens,
+            freeze_backbone=True,
+        ).to(device)
+
+    image_encoder.load_state_dict(enc_sd)
     image_encoder.eval()
 
     # ========================================================
-    # NOISY LATENT CLASSIFIER
+    # NOISY LATENT CLASSIFIER  (opcional — ausente em ckpts antigos)
     # ========================================================
 
-    classifier = NoisyLatentAttrClassifier(
-        latent_dim=4,
-        time_emb_dim=256,
-        num_attrs=40,
-    ).to(device)
-
-    classifier.load_state_dict(
-        ckpt.get("ema_classifier_state_dict", ckpt["classifier_state_dict"])
+    has_classifier = (
+        "classifier_state_dict" in ckpt
+        or "ema_classifier_state_dict" in ckpt
     )
-    classifier.eval()
+
+    if has_classifier:
+        classifier = NoisyLatentAttrClassifier(
+            latent_dim=4,
+            time_emb_dim=256,
+            num_attrs=40,
+        ).to(device)
+        classifier.load_state_dict(
+            ckpt.get("ema_classifier_state_dict", ckpt["classifier_state_dict"])
+        )
+        classifier.eval()
+        print("  classifier: carregado")
+    else:
+        classifier = None
+        print("  classifier: ausente no checkpoint — CG de atributos desativado")
+        if args.cg_scale_attr > 0:
+            print("  [aviso] --cg_scale_attr ignorado (sem classificador no checkpoint)")
 
     # ========================================================
     # DIFFUSION

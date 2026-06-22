@@ -30,6 +30,7 @@ sys.path.append(
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from tqdm import tqdm
@@ -108,7 +109,7 @@ def build_img_context(
 ):
     """
     ref_img : [B, 3, H, W]  em [-1, 1]
-    retorna : [B, 512, num_img_tokens]
+    retorna : [B, 512, 2*num_img_tokens]  (CLIP tokens + ArcFace tokens concatenados)
     """
     img_tokens = image_encoder(ref_img)   # [B, 512, num_img_tokens]
 
@@ -116,6 +117,61 @@ def build_img_context(
         img_tokens = torch.zeros_like(img_tokens)
 
     return img_tokens
+
+
+# =========================================================
+# HYBRID SAMPLING  (image CFG + attribute classifier guidance)
+# =========================================================
+
+def _sample_hybrid(
+    unet,
+    classifier,
+    diffusion,
+    img_context,
+    fixed_attrs,
+    n,
+    channels,
+    device,
+    cfg_scale_img=3.0,
+    cg_scale_attr=1.0,
+):
+    unet.eval()
+    classifier.eval()
+
+    img_size = diffusion.img_size
+    z_t = torch.randn(n, channels, img_size, img_size, device=device)
+    zeros_ctx = torch.zeros_like(img_context)
+
+    for i in reversed(range(1, diffusion.noise_steps)):
+
+        t_vec = torch.full((n,), i, device=device, dtype=torch.long)
+
+        alpha_hat_t = diffusion.alpha_hat[t_vec][:, None, None, None]
+        alpha_t     = diffusion.alpha[t_vec][:, None, None, None]
+        beta_t      = diffusion.beta[t_vec][:, None, None, None]
+
+        with torch.no_grad():
+            eps_cond   = unet(z_t, t_vec, context=img_context)
+            eps_uncond = unet(z_t, t_vec, context=zeros_ctx)
+
+        eps = eps_uncond + cfg_scale_img * (eps_cond - eps_uncond)
+
+        z_for_cls = z_t.detach().requires_grad_(True)
+        logits = classifier(z_for_cls, t_vec)
+        log_p  = (
+            F.logsigmoid(logits) * fixed_attrs
+            + F.logsigmoid(-logits) * (1.0 - fixed_attrs)
+        )
+        grad = torch.autograd.grad(log_p.sum(), z_for_cls)[0]
+        eps = eps - cg_scale_attr * torch.sqrt(1.0 - alpha_hat_t) * grad.detach()
+
+        noise = torch.randn_like(z_t) if i > 1 else torch.zeros_like(z_t)
+        z_t = (
+            (1.0 / torch.sqrt(alpha_t))
+            * (z_t - (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t) * eps)
+        ) + torch.sqrt(beta_t) * noise
+
+    return z_t
 
 
 # =========================================================
@@ -401,9 +457,10 @@ def train(args):
             ).convert("RGB")
             _orig = train_base.transform(_img)
 
-            samples_fixed.append((_ref, _orig))
+            samples_fixed.append((_ref, _orig, _attrs))
 
         fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed]).to(device)
+        fixed_attrs    = torch.stack([s[2] for s in samples_fixed]).to(device)
         orig_imgs      = torch.stack([s[1] for s in samples_fixed])
 
         save_images(
@@ -689,44 +746,71 @@ def train(args):
 
         if is_master and (epoch % 10 == 0 or epoch == args.epochs - 1):
 
-            print("Gerando imagens...")
-
             ema_model.eval()
             ema_image_encoder.eval()
+            ema_classifier.eval()
 
             with torch.no_grad():
-
                 context_test = build_img_context(
                     ema_image_encoder,
                     fixed_ref_imgs.to(device),
                     training=False,
                 )
 
-                sampled_latents = diffusion.sample(
+            # -----------------------------------------------
+            # 1. Image CFG only
+            # -----------------------------------------------
+            print("Gerando imagens (image CFG)...")
+
+            with torch.no_grad():
+                latents_img = diffusion.sample(
                     ema_model,
                     n=16,
                     context=context_test,
                     channels=latent_dim,
                 )
-
-                sampled_latents = sampled_latents / 0.18215
-
-                sampled_images = vae.decode(sampled_latents)
+                images_img = vae.decode(latents_img / 0.18215)
 
             save_images(
-                sampled_images,
-                os.path.join(results_dir, f"{epoch}.jpg"),
+                images_img,
+                os.path.join(results_dir, f"{epoch}_img.jpg"),
                 nrow=4,
             )
-
-            grid = make_grid(
-                sampled_images,
-                nrow=4,
-                normalize=True,
-                value_range=(-1, 1),
+            board.log_image(
+                "Samples/ImageCFG",
+                make_grid(images_img, nrow=4, normalize=True, value_range=(-1, 1)),
+                epoch,
             )
 
-            board.log_image("Samples/Generated", grid, epoch)
+            # -----------------------------------------------
+            # 2. Full conditioning: image CFG + attribute CG
+            # -----------------------------------------------
+            print("Gerando imagens (image CFG + attribute CG)...")
+
+            latents_hybrid = _sample_hybrid(
+                unet=ema_model,
+                classifier=ema_classifier,
+                diffusion=diffusion,
+                img_context=context_test,
+                fixed_attrs=fixed_attrs,
+                n=16,
+                channels=latent_dim,
+                device=device,
+            )
+
+            with torch.no_grad():
+                images_hybrid = vae.decode(latents_hybrid / 0.18215)
+
+            save_images(
+                images_hybrid,
+                os.path.join(results_dir, f"{epoch}_hybrid.jpg"),
+                nrow=4,
+            )
+            board.log_image(
+                "Samples/Hybrid",
+                make_grid(images_hybrid, nrow=4, normalize=True, value_range=(-1, 1)),
+                epoch,
+            )
 
     # =====================================================
     # FINALIZE
@@ -789,7 +873,7 @@ if __name__ == "__main__":
         default=None,
         help="Resume deste treino (ckpt gerado por este script).",
     )
-o
+
     parser.add_argument(
         "--warmstart_ckpt",
         type=str,
