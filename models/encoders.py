@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
+from transformers import CLIPVisionModel
 
 
 # =========================================================
@@ -189,93 +190,146 @@ class ArcFaceEncoder(nn.Module):
 # IMAGE CONDITION ENCODER  (IP-Adapter style, sem ArcFace)
 # =========================================================
 
+
+
 class ImageConditionEncoder(nn.Module):
-    """
-    Extrai tokens espaciais de identidade de uma imagem de referência.
-
-    Arquitetura: ResNet-18 (ImageNet, frozen até layer3) + projeção treinável.
-
-    Fluxo de tensores
-    -----------------
-    ref_img  [B, 3, H, W]  em [-1, 1]
-        → renorm ImageNet
-        → backbone (conv1..layer3)  → [B, 256, H/16, W/16]
-        → AdaptiveAvgPool2d(side, side) → [B, 256, side, side]
-        → flatten                   → [B, 256, num_tokens]
-        → permute                   → [B, num_tokens, 256]
-        → LayerNorm + Linear + GELU + Linear → [B, num_tokens, context_dim]
-        → permute                   → [B, context_dim, num_tokens]  ← formato do contexto
-
-    Para 256×256 e num_tokens=16 (side=4):
-        backbone produz [B, 256, 16, 16] → pool → [B, 256, 4, 4] → 16 tokens
-    """
 
     def __init__(
         self,
-        context_dim: int = 512,
-        num_tokens: int = 16,
-        freeze_backbone: bool = True,
+        context_dim=512,
+        num_tokens=16,
+        freeze_backbone=True,
     ):
         super().__init__()
 
-        import math
-        side = int(math.isqrt(num_tokens))
-        if side * side != num_tokens:
-            raise ValueError(f"num_tokens={num_tokens} deve ser quadrado perfeito (ex: 4, 9, 16, 25)")
+        self.num_tokens = num_tokens
 
-        backbone = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+        # =====================================================
+        # CLIP
+        # =====================================================
 
-        # layer3 de ResNet-18: 256 canais, stride acumulado 16
-        self.backbone = nn.Sequential(
-            backbone.conv1,
-            backbone.bn1,
-            backbone.relu,
-            backbone.maxpool,
-            backbone.layer1,
-            backbone.layer2,
-            backbone.layer3,
+        self.clip = CLIPVisionModel.from_pretrained(
+            "openai/clip-vit-base-patch32"
         )
-        feat_dim = 256  # canais de saída do layer3 do ResNet-18
 
         if freeze_backbone:
-            for p in self.backbone.parameters():
+            for p in self.clip.parameters():
                 p.requires_grad = False
 
-        self.pool = nn.AdaptiveAvgPool2d((side, side))
+        clip_dim = self.clip.config.hidden_size  # 768
 
-        self.proj = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, context_dim),
+        self.context_dim = context_dim
+
+        self.clip_proj = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.Linear(clip_dim, context_dim),
             nn.GELU(),
             nn.Linear(context_dim, context_dim),
         )
 
-        self.num_tokens = num_tokens
+        # =====================================================
+        # ArcFace
+        # =====================================================
 
-        # Normalização ImageNet registrada como buffer (move com .to(device))
+        self.arcface = ArcFaceEncoder()
+
+        self.id_proj = nn.Sequential(
+                        nn.Linear(
+                            512,
+                            context_dim * num_tokens
+                        ),
+                        nn.GELU(),
+                    )
+        self.id_norm = nn.LayerNorm(context_dim)
+        # =====================================================
+        # CLIP normalization
+        # =====================================================
+
         self.register_buffer(
-            "imagenet_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "imagenet_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            "clip_mean",
+            torch.tensor(
+                [0.48145466, 0.4578275, 0.40821073]
+            ).view(1, 3, 1, 1)
         )
 
-    def forward(self, ref_img: torch.Tensor) -> torch.Tensor:
-        """
-        ref_img: [B, 3, H, W] float em [-1, 1]
-        retorna: [B, context_dim, num_tokens]
-        """
-        # [-1, 1] → [0, 1] → normalização ImageNet
+        self.register_buffer(
+            "clip_std",
+            torch.tensor(
+                [0.26862954, 0.26130258, 0.27577711]
+            ).view(1, 3, 1, 1)
+        )
+
+    def forward(self, ref_img):
+
+        # -----------------------------------------------------
+        # [-1,1] -> [0,1]
+        # -----------------------------------------------------
+
         x = ref_img.float() * 0.5 + 0.5
-        x = (x - self.imagenet_mean) / self.imagenet_std
 
-        feats = self.backbone(x)           # [B, 256, H/16, W/16]
-        feats = self.pool(feats)            # [B, 256, side, side]
-        feats = feats.flatten(2)            # [B, 256, num_tokens]
-        feats = feats.permute(0, 2, 1)     # [B, num_tokens, 256]
+        x = (x - self.clip_mean) / self.clip_std
 
-        tokens = self.proj(feats)           # [B, num_tokens, context_dim]
+        # -----------------------------------------------------
+        # CLIP
+        # -----------------------------------------------------
 
-        return tokens.permute(0, 2, 1)     # [B, context_dim, num_tokens]
+        clip_out = self.clip(
+            pixel_values=x
+        )
+
+        clip_tokens = clip_out.last_hidden_state
+
+        # remove CLS token
+
+        clip_tokens = clip_tokens[:, 1:, :]
+
+        # [B,49,768] -> [B,768,49]
+
+        clip_tokens = clip_tokens.transpose(1, 2)
+
+        # reduz para 16 tokens
+
+        clip_tokens = F.adaptive_avg_pool1d(
+            clip_tokens,
+            self.num_tokens
+        )
+
+        # [B,768,16] -> [B,16,768]
+
+        clip_tokens = clip_tokens.transpose(1, 2)
+
+        clip_tokens = self.clip_proj(
+            clip_tokens
+        )
+
+        # -----------------------------------------------------
+        # ArcFace
+        # -----------------------------------------------------
+
+        with torch.no_grad():
+            id_emb = self.arcface(ref_img)
+
+        id_tokens = self.id_proj(
+            id_emb
+        )
+        B = id_tokens.shape[0]
+        id_tokens = id_tokens.view(
+                        B,
+                        self.num_tokens,
+                        self.context_dim
+                    )
+
+        self.id_norm = nn.LayerNorm(context_dim)
+
+        # -----------------------------------------------------
+        # concat
+        # -----------------------------------------------------
+
+        tokens = torch.cat(
+            [clip_tokens, id_tokens],
+            dim=1
+        )
+
+        # [B,17,512] -> [B,512,17]
+
+        return tokens.permute(0, 2, 1)

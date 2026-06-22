@@ -789,7 +789,7 @@ if __name__ == "__main__":
         default=None,
         help="Resume deste treino (ckpt gerado por este script).",
     )
-
+o
     parser.add_argument(
         "--warmstart_ckpt",
         type=str,
