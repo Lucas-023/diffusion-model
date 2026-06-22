@@ -267,6 +267,8 @@ class ImageConditionEncoder(nn.Module):
 
         x = ref_img.float() * 0.5 + 0.5
 
+        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+
         x = (x - self.clip_mean) / self.clip_std
 
         # -----------------------------------------------------
@@ -318,8 +320,7 @@ class ImageConditionEncoder(nn.Module):
                         self.num_tokens,
                         self.context_dim
                     )
-
-        self.id_norm = nn.LayerNorm(context_dim)
+        id_tokens = self.id_norm(id_tokens)
 
         # -----------------------------------------------------
         # concat
