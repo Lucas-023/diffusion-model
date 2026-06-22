@@ -76,6 +76,7 @@ def clip_encode(clip_model, imgs_01, device):
     clip_std  = _CLIP_STD.to(device)
 
     x = imgs_01.float() * 0.5 + 0.5          # [-1,1] -> [0,1]
+    x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
     x = (x - clip_mean) / clip_std
 
     out = clip_model(pixel_values=x)
