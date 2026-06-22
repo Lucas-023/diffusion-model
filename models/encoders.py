@@ -157,7 +157,7 @@ class ArcFaceEncoder(nn.Module):
             self._model_path,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
-        self._rec.prepare(ctx_id=-1)
+        self._rec.prepare(ctx_id=0)
 
     @torch.no_grad()
     def forward(self, img: torch.Tensor) -> torch.Tensor:
