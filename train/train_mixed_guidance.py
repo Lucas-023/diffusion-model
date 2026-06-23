@@ -4,7 +4,8 @@ train_mixed_guidance.py
 Treino combinado de dois modelos para guidance híbrida na inferência:
 
   1. LDM condicionado só na IMAGEM de referência (Classifier-Free Guidance)
-       - ImageConditionEncoder extrai tokens da imagem de referência
+       - ImageConditionEncoder (CLIP-ViT-B/32 + ArcFace buffalo_l) extrai
+         tokens da imagem de referência → [B, 512, 2*num_img_tokens]
        - CFG dropout na imagem com prob cfg_dropout_img
        - Na inferência: eps = eps_uncond + s_img*(eps_cond - eps_uncond)
 
@@ -111,7 +112,7 @@ def build_img_context(
     ref_img : [B, 3, H, W]  em [-1, 1]
     retorna : [B, 512, 2*num_img_tokens]  (CLIP tokens + ArcFace tokens concatenados)
     """
-    img_tokens = image_encoder(ref_img)   # [B, 512, num_img_tokens]
+    img_tokens = image_encoder(ref_img)   # [B, 512, 2*num_img_tokens]
 
     if training and torch.rand(1).item() < cfg_dropout_img:
         img_tokens = torch.zeros_like(img_tokens)
@@ -850,14 +851,15 @@ if __name__ == "__main__":
         "--freeze_backbone",
         action="store_true",
         default=True,
-        help="Congela backbone ResNet-18 do ImageEncoder (treina só a projeção).",
+        help="Congela backbone CLIP do ImageEncoder (ArcFace é sempre frozen; "
+             "treina só as projeções clip_proj / id_proj).",
     )
 
     parser.add_argument(
         "--no_freeze_backbone",
         dest="freeze_backbone",
         action="store_false",
-        help="Treina o backbone ResNet-18 end-to-end.",
+        help="Treina o backbone CLIP end-to-end (ArcFace continua frozen).",
     )
 
     parser.add_argument(

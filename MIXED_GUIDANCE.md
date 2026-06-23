@@ -17,8 +17,11 @@ A UNet recebe **apenas tokens da imagem** via cross-attention. Durante o treino,
 
 ```
 ref_img [B, 3, 256, 256]
-    → ImageConditionEncoder (ResNet-18 frozen + projeção treinável)
-    → [B, 512, 16]   ← contexto da UNet
+    → ImageConditionEncoder
+        ├─ CLIP-ViT-B/32 (frozen) → clip_proj  → [B, num_tokens, 512]
+        └─ ArcFace buffalo_l (frozen) → id_proj → [B, num_tokens, 512]
+        → concat tokens → [B, 2*num_tokens, 512] → permute
+    → [B, 512, 2*num_tokens]   ← contexto da UNet (default num_tokens=16 → 32)
 ```
 
 Na inferência, CFG interpola entre os dois modos:
