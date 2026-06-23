@@ -162,13 +162,22 @@ def main(args):
 
         for i, fname in enumerate(fnames):
             stem = os.path.splitext(fname)[0]
+            final_path = os.path.join(CACHE_DIR, stem + ".pt")
+            tmp_path   = final_path + ".tmp"
+
+            # .clone().contiguous() quebra o storage compartilhado com o batch
+            # (sem isso, cada arquivo guardaria os 64 samples do batch — bug
+            # antigo que gerava arquivos de 9.4 MB em vez de ~150 KB).
             torch.save(
                 {
-                    "arcface": arc_embs[i].cpu(),    # [512]
-                    "clip":    clip_tokens[i],        # [seq_len, 768]
+                    "arcface": arc_embs[i].detach().cpu().clone().contiguous(),  # [512]
+                    "clip":    clip_tokens[i].detach().clone().contiguous(),      # [seq_len, 768]
                 },
-                os.path.join(CACHE_DIR, stem + ".pt"),
+                tmp_path,
             )
+            # rename é atômico no mesmo filesystem — se crashar antes daqui,
+            # sobra só um .tmp que pode ser apagado, nunca um .pt corrompido.
+            os.replace(tmp_path, final_path)
 
     print(f"\nCache salvo em {CACHE_DIR}/")
     print("Formato por arquivo: dict com chaves 'arcface' [512] e 'clip' [seq_len, 768]")
