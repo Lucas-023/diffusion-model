@@ -16,6 +16,35 @@ Treino combinado de dois modelos para guidance híbrida na inferência:
 
 Os dois modelos compartilham o z_t amostrado de cada batch, mas têm
 optimizadores independentes (lr separado via --lr_cls).
+
+-----------------------------------------------------------------
+ACELERAÇÃO POR CACHE DE ENCODER (importante)
+-----------------------------------------------------------------
+O `ImageConditionEncoder` tem duas branches caras:
+  - CLIP-ViT-B/32 forward (GPU, ~768-d patch tokens)
+  - ArcFace ONNX (CPU↔GPU + rebind dinâmico do ONNX Runtime — foi
+    a causa do warning `Expected shape from model of {1,512} does
+    not match actual shape of {64,512}` e de 2+ s/it)
+
+Como os dois encoders são FROZEN e DETERMINÍSTICOS, seus outputs
+são iguais a cada epoch para a mesma imagem. Roda-se UMA VEZ:
+
+    python cache_arcface.py
+
+que salva em ./cache_encoder/{stem}.pt um dict:
+    "arcface" : [512]          embedding ArcFace L2-normalizado
+    "clip"    : [seq_len, 768] tokens CLIP (CLS removido, pré-projeção)
+
+`get_data_imagecond` detecta o diretório automaticamente:
+  - cache presente → dataset retorna (latent, attrs, ref_img,
+    id_emb, clip_tokens_raw). O encoder pula CLIP+ArcFace e roda
+    apenas as projeções treináveis (clip_proj / id_proj / id_norm).
+  - cache ausente  → fallback (latent, attrs, ref_img) e o encoder
+    roda CLIP/ArcFace live como antes (mais lento).
+
+`ref_img` continua sendo retornado em ambos os modos porque é
+usado para visualização (fixed samples / originals).
+-----------------------------------------------------------------
 """
 
 import os
@@ -104,15 +133,22 @@ def update_ema(ema_model, model, decay=0.9999):
 
 def build_img_context(
     image_encoder,
-    ref_img,
+    ref_img=None,
+    id_emb=None,
+    clip_tokens_raw=None,
     cfg_dropout_img: float = 0.1,
     training: bool = True,
 ):
     """
-    ref_img : [B, 3, H, W]  em [-1, 1]
-    retorna : [B, 512, 2*num_img_tokens]  (CLIP tokens + ArcFace tokens concatenados)
+    Modo live    : passar ref_img → roda CLIP + ArcFace.
+    Modo cache   : passar id_emb e clip_tokens_raw (ref_img é ignorado pelo encoder).
+    retorna      : [B, 512, 2*num_img_tokens]
     """
-    img_tokens = image_encoder(ref_img)   # [B, 512, 2*num_img_tokens]
+    img_tokens = image_encoder(
+        ref_img=ref_img,
+        id_emb=id_emb,
+        clip_tokens_raw=clip_tokens_raw,
+    )
 
     if training and torch.rand(1).item() < cfg_dropout_img:
         img_tokens = torch.zeros_like(img_tokens)
@@ -195,10 +231,15 @@ def train(args):
     # Retorna (latent, attrs, ref_img) por sample.
     # =====================================================
 
-    train_loader, val_loader, _, train_sampler = get_data_imagecond(
+    train_loader, val_loader, _, train_sampler, use_cache = get_data_imagecond(
         args,
         is_distributed=True,
     )
+
+    if is_master:
+        print(
+            f"[Encoder] modo {'CACHE (rápido)' if use_cache else 'LIVE (lento — rode cache_arcface.py)'}"
+        )
 
     # =====================================================
     # CONFIG
@@ -449,8 +490,14 @@ def train(args):
 
         samples_fixed = []
         for _i in range(min(16, len(train_loader.dataset))):
-            real_idx      = train_loader.dataset.indices[_i]
-            _, _attrs, _ref = train_base[real_idx]
+            real_idx = train_loader.dataset.indices[_i]
+            sample   = train_base[real_idx]
+
+            if use_cache:
+                _, _attrs, _ref, _idemb, _cliptok = sample
+            else:
+                _, _attrs, _ref = sample
+                _idemb, _cliptok = None, None
 
             _fname = train_base.samples[real_idx][0]
             _img   = PILImage.open(
@@ -458,11 +505,18 @@ def train(args):
             ).convert("RGB")
             _orig = train_base.transform(_img)
 
-            samples_fixed.append((_ref, _orig, _attrs))
+            samples_fixed.append((_ref, _orig, _attrs, _idemb, _cliptok))
 
         fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed]).to(device)
         fixed_attrs    = torch.stack([s[2] for s in samples_fixed]).to(device)
         orig_imgs      = torch.stack([s[1] for s in samples_fixed])
+
+        if use_cache:
+            fixed_id_emb    = torch.stack([s[3] for s in samples_fixed]).to(device)
+            fixed_clip_raw  = torch.stack([s[4] for s in samples_fixed]).to(device)
+        else:
+            fixed_id_emb   = None
+            fixed_clip_raw = None
 
         save_images(
             orig_imgs,
@@ -495,7 +549,16 @@ def train(args):
         optimizer_diff.zero_grad(set_to_none=True)
         optimizer_cls.zero_grad(set_to_none=True)
 
-        for i, (latents, attrs, ref_img) in enumerate(pbar):
+        for i, batch in enumerate(pbar):
+
+            if use_cache:
+                latents, attrs, ref_img, id_emb, clip_tokens_raw = batch
+                id_emb          = id_emb.to(device, non_blocking=True)
+                clip_tokens_raw = clip_tokens_raw.to(device, non_blocking=True)
+            else:
+                latents, attrs, ref_img = batch
+                id_emb          = None
+                clip_tokens_raw = None
 
             latents = latents.to(device, non_blocking=True)
             attrs   = attrs.to(device,   non_blocking=True)
@@ -540,7 +603,9 @@ def train(args):
 
                     context = build_img_context(
                         image_encoder,
-                        ref_img,
+                        ref_img=ref_img,
+                        id_emb=id_emb,
+                        clip_tokens_raw=clip_tokens_raw,
                         cfg_dropout_img=args.cfg_dropout_img,
                         training=True,
                     )
@@ -622,7 +687,16 @@ def train(args):
 
         with torch.no_grad():
 
-            for latents, attrs, ref_img in val_loader:
+            for batch in val_loader:
+
+                if use_cache:
+                    latents, attrs, ref_img, id_emb, clip_tokens_raw = batch
+                    id_emb          = id_emb.to(device, non_blocking=True)
+                    clip_tokens_raw = clip_tokens_raw.to(device, non_blocking=True)
+                else:
+                    latents, attrs, ref_img = batch
+                    id_emb          = None
+                    clip_tokens_raw = None
 
                 latents = latents.to(device, non_blocking=True)
                 attrs   = attrs.to(device,   non_blocking=True)
@@ -635,7 +709,11 @@ def train(args):
                     z_t, noise = diffusion.noise_images(latents, t)
 
                     context = build_img_context(
-                        image_encoder, ref_img, training=False
+                        image_encoder,
+                        ref_img=ref_img,
+                        id_emb=id_emb,
+                        clip_tokens_raw=clip_tokens_raw,
+                        training=False,
                     )
 
                     predicted_noise = model(z_t, t, context=context)
@@ -754,7 +832,9 @@ def train(args):
             with torch.no_grad():
                 context_test = build_img_context(
                     ema_image_encoder,
-                    fixed_ref_imgs.to(device),
+                    ref_img=fixed_ref_imgs.to(device),
+                    id_emb=fixed_id_emb,
+                    clip_tokens_raw=fixed_clip_raw,
                     training=False,
                 )
 
@@ -860,6 +940,15 @@ if __name__ == "__main__":
         dest="freeze_backbone",
         action="store_false",
         help="Treina o backbone CLIP end-to-end (ArcFace continua frozen).",
+    )
+
+    parser.add_argument(
+        "--encoder_cache_dir",
+        type=str,
+        default="./cache_encoder",
+        help="Diretório com embeddings ArcFace+CLIP pré-computados por cache_arcface.py. "
+             "Se existir e contiver arquivos, o treino pula CLIP/ArcFace live "
+             "(grande aceleração). Caso contrário roda live como fallback.",
     )
 
     parser.add_argument(

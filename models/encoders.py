@@ -259,31 +259,31 @@ class ImageConditionEncoder(nn.Module):
             ).view(1, 3, 1, 1)
         )
 
-    def forward(self, ref_img):
+    def forward(self, ref_img=None, id_emb=None, clip_tokens_raw=None):
+        """
+        Modo live (treino sem cache):
+            ref_img : [B, 3, H, W] em [-1, 1]   → roda CLIP + ArcFace
+        Modo cacheado (treino com ./cache_encoder/):
+            id_emb          : [B, 512]          → ArcFace pré-computado
+            clip_tokens_raw : [B, seq_len, 768] → tokens CLIP pré-computados (CLS removido)
+        Pode-se também passar só um dos dois cacheados (o outro roda live).
+        """
 
         # -----------------------------------------------------
-        # [-1,1] -> [0,1]
+        # CLIP — usa cache se fornecido
         # -----------------------------------------------------
 
-        x = ref_img.float() * 0.5 + 0.5
+        if clip_tokens_raw is None:
+            assert ref_img is not None, "Sem cache de CLIP é preciso ref_img."
 
-        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+            x = ref_img.float() * 0.5 + 0.5
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+            x = (x - self.clip_mean) / self.clip_std
 
-        x = (x - self.clip_mean) / self.clip_std
-
-        # -----------------------------------------------------
-        # CLIP
-        # -----------------------------------------------------
-
-        clip_out = self.clip(
-            pixel_values=x
-        )
-
-        clip_tokens = clip_out.last_hidden_state
-
-        # remove CLS token
-
-        clip_tokens = clip_tokens[:, 1:, :]
+            clip_out = self.clip(pixel_values=x)
+            clip_tokens = clip_out.last_hidden_state[:, 1:, :]  # remove CLS → [B,49,768]
+        else:
+            clip_tokens = clip_tokens_raw                       # [B, seq_len, 768]
 
         # [B,49,768] -> [B,768,49]
 
@@ -305,11 +305,13 @@ class ImageConditionEncoder(nn.Module):
         )
 
         # -----------------------------------------------------
-        # ArcFace
+        # ArcFace — usa cache se fornecido
         # -----------------------------------------------------
 
-        with torch.no_grad():
-            id_emb = self.arcface(ref_img)
+        if id_emb is None:
+            assert ref_img is not None, "Sem cache de ArcFace é preciso ref_img."
+            with torch.no_grad():
+                id_emb = self.arcface(ref_img)
 
         id_tokens = self.id_proj(
             id_emb

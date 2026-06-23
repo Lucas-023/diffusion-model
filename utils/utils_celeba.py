@@ -721,11 +721,68 @@ def get_data_identity(args, is_distributed=True):
 # Sempre carrega imagens brutas (nunca cache ArcFace).
 # ==========================================
 
+class CelebALatentImageCondCachedDataset(CelebALatentIdentityDataset):
+    """
+    Variante do dataset de identidade que usa o cache pré-computado por
+    `cache_arcface.py` (./cache_encoder/{stem}.pt → {"arcface":[512],
+    "clip":[seq_len,768]}) e também carrega a imagem bruta — útil para
+    visualização/originais.
+
+    Cada sample retorna:
+        latent          : [4, 32, 32]
+        attrs           : [40]
+        ref_img         : [3, 256, 256]  em [-1, 1]
+        id_emb          : [512]          ArcFace L2-normalizado
+        clip_tokens_raw : [49, 768]      tokens CLIP (CLS removido, pré-projeção)
+    """
+
+    def __init__(self, latent_dir, attr_path, image_dir, encoder_cache_dir, transform=None):
+        super().__init__(
+            latent_dir=latent_dir,
+            attr_path=attr_path,
+            image_dir=image_dir,
+            arcface_dir=None,
+            transform=transform,
+        )
+        self.encoder_cache_dir = encoder_cache_dir
+
+    def __getitem__(self, idx):
+        img_filename, latent_filename, _ = self.samples[idx]
+
+        data = torch.load(
+            os.path.join(self.latent_dir, latent_filename),
+            map_location="cpu",
+        )
+        latent = data["latent"]
+        attrs  = data["attrs"]
+
+        img = Image.open(
+            os.path.join(self.image_dir, img_filename)
+        ).convert("RGB")
+        ref_img = self.transform(img)
+
+        stem = os.path.splitext(img_filename)[0]
+        cache = torch.load(
+            os.path.join(self.encoder_cache_dir, stem + ".pt"),
+            map_location="cpu",
+        )
+        id_emb          = cache["arcface"]   # [512]
+        clip_tokens_raw = cache["clip"]      # [seq_len, 768]
+
+        return latent, attrs, ref_img, id_emb, clip_tokens_raw
+
+
 def get_data_imagecond(args, is_distributed=True):
     """
-    Igual a get_data_identity mas força arcface_dir=None.
-    Cada sample retorna (latent, attrs, ref_img) onde
-    ref_img é [3, 256, 256] em [-1, 1].
+    Dataloader para condicionamento por imagem.
+
+    Detecta automaticamente o cache em ./cache_encoder/ (gerado por
+    `cache_arcface.py`). Se presente, retorna samples cacheados (5-tupla:
+    latent, attrs, ref_img, id_emb, clip_tokens_raw) — ArcFace e CLIP
+    não são executados durante o treino. Caso contrário, cai no modo
+    live (3-tupla: latent, attrs, ref_img).
+
+    Retorna (train_loader, val_loader, test_loader, train_sampler, use_cache).
     """
 
     latent_dir = "./cache_latent"
@@ -745,12 +802,25 @@ def get_data_imagecond(args, is_distributed=True):
     else:
         raise FileNotFoundError("Nenhum arquivo de atributos encontrado.")
 
-    dataset = CelebALatentIdentityDataset(
-        latent_dir=latent_dir,
-        attr_path=attr_path,
-        image_dir=image_dir,
-        arcface_dir=None,   # sempre imagem bruta
-    )
+    encoder_cache_dir = getattr(args, "encoder_cache_dir", "./cache_encoder")
+    use_cache = os.path.isdir(encoder_cache_dir) and len(os.listdir(encoder_cache_dir)) > 0
+
+    if use_cache:
+        print(f"Cache de encoder detectado: {encoder_cache_dir} — usando embeddings pré-computados.")
+        dataset = CelebALatentImageCondCachedDataset(
+            latent_dir=latent_dir,
+            attr_path=attr_path,
+            image_dir=image_dir,
+            encoder_cache_dir=encoder_cache_dir,
+        )
+    else:
+        print(f"Cache de encoder NÃO encontrado em {encoder_cache_dir} — rodando ArcFace/CLIP live (lento).")
+        dataset = CelebALatentIdentityDataset(
+            latent_dir=latent_dir,
+            attr_path=attr_path,
+            image_dir=image_dir,
+            arcface_dir=None,
+        )
 
     train_size = int(0.70 * len(dataset))
     val_size   = int(0.15 * len(dataset))
@@ -810,7 +880,7 @@ def get_data_imagecond(args, is_distributed=True):
             **loader_kwargs,
         )
 
-        return train_loader, val_loader, test_loader, train_sampler
+        return train_loader, val_loader, test_loader, train_sampler, use_cache
 
     else:
 
@@ -838,4 +908,4 @@ def get_data_imagecond(args, is_distributed=True):
             **loader_kwargs,
         )
 
-        return train_loader, val_loader, test_loader, None
+        return train_loader, val_loader, test_loader, None, use_cache
