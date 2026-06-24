@@ -279,6 +279,11 @@ def sample_hybrid(
 
             grad = torch.autograd.grad(score, z_for_cls)[0]
 
+            # Normaliza o gradiente para magnitude unitária por amostra,
+            # evitando que gradientes pequenos sejam abafados pelo CFG.
+            grad_norm = grad.flatten(1).norm(dim=1, keepdim=True)[..., None, None]
+            grad = grad / (grad_norm + 1e-8)
+
             # Escala o gradiente de acordo com o nível de ruído
             eps = eps - cg_scale_attr * torch.sqrt(1.0 - alpha_hat_t) * grad.detach()
 
