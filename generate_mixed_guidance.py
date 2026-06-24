@@ -211,13 +211,14 @@ def sample_hybrid(
     unet,
     classifier,           # NoisyLatentAttrClassifier ou None (desativa CG)
     diffusion,
-    img_context,          # [N, 512, num_img_tokens]  tokens da imagem condicionada
+    img_context,          # [N, 512, 2*T]  tokens da imagem condicionada
     attrs,                # [N, 40]  atributos alvo (float)
     n,
     channels=4,
     cfg_scale_img=3.0,
     cg_scale_attr=1.0,
     cg_t_thresh=None,     # aplica CG só para t <= cg_t_thresh (None = todos)
+    identity_only=False,  # zera tokens CLIP, usa só ArcFace (remove expressão da ref)
     device="cuda",
 ):
     """
@@ -234,6 +235,14 @@ def sample_hybrid(
 
     # Ruído inicial
     z_t = torch.randn(n, channels, img_size, img_size, device=device)
+
+    # identity_only: zera a metade CLIP do contexto (primeiros T dos 2T tokens).
+    # O encoder concatena [clip_tokens | arcface_tokens] → shape [B, 512, 2T].
+    # Com isso o CFG ancora só na identidade, não na expressão da referência.
+    if identity_only:
+        T = img_context.shape[2] // 2
+        img_context = img_context.clone()
+        img_context[:, :, :T] = 0.0
 
     zeros_ctx = torch.zeros_like(img_context)  # contexto vazio para CFG
 
@@ -278,11 +287,6 @@ def sample_hybrid(
             score = log_p.sum()
 
             grad = torch.autograd.grad(score, z_for_cls)[0]
-
-            # Normaliza o gradiente para magnitude unitária por amostra,
-            # evitando que gradientes pequenos sejam abafados pelo CFG.
-            grad_norm = grad.flatten(1).norm(dim=1, keepdim=True)[..., None, None]
-            grad = grad / (grad_norm + 1e-8)
 
             # Escala o gradiente de acordo com o nível de ruído
             eps = eps - cg_scale_attr * torch.sqrt(1.0 - alpha_hat_t) * grad.detach()
@@ -472,6 +476,7 @@ def generate(args):
                 cfg_scale_img=args.cfg_scale_img,
                 cg_scale_attr=args.cg_scale_attr,
                 cg_t_thresh=args.cg_t_thresh,
+                identity_only=args.identity_only,
                 device=device,
             )
 
@@ -579,6 +584,7 @@ def generate(args):
         cfg_scale_img=args.cfg_scale_img,
         cg_scale_attr=args.cg_scale_attr,
         cg_t_thresh=args.cg_t_thresh,
+        identity_only=args.identity_only,
         device=device,
     )
 
@@ -648,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="models/LDM_MixedGuidance/ckpt.pt",
+        default="models/LDM_MIxedGuidance_v1/ckpt_best.pt",
         help="Checkpoint gerado por train_mixed_guidance.py.",
     )
 
@@ -706,14 +712,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cfg_scale_img",
         type=float,
-        default=3.0,
+        default=1.0,
         help="Escala de CFG para a imagem de referência (0 = sem CFG).",
     )
 
     parser.add_argument(
         "--cg_scale_attr",
         type=float,
-        default=1.0,
+        default=15.0,
         help="Escala de Classifier Guidance para atributos (0 = sem CG).",
     )
 
@@ -753,6 +759,14 @@ if __name__ == "__main__":
         type=str,
         default="cuda",
         help="Device: cuda ou cpu.",
+    )
+
+    parser.add_argument(
+        "--identity_only",
+        action="store_true",
+        help="Zera os tokens CLIP do contexto, usando só ArcFace para o CFG. "
+             "Remove a expressão da referência do condicionamento, dando mais "
+             "liberdade ao CG para editar atributos.",
     )
 
     args = parser.parse_args()
