@@ -47,6 +47,7 @@ from models.encoders import ImageConditionEncoder, AttributePredictor
 from models.modules import NoisyLatentAttrClassifier
 from diffusion.conditional_ddpm import Diffusion_conditional
 from vae.modules import VAE
+from utils.utils_celeba import CelebALatentIdentityDataset
 
 
 # ============================================================
@@ -139,6 +140,54 @@ TRANSFORM = T.Compose([
     T.ToTensor(),
     T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
 ])
+
+
+def _load_test_samples(n, seed, data_root="./CelebA_data", latent_dir="./cache_latent"):
+    """Carrega n amostras aleatórias do split de teste (mesmo seed=42 do treino)."""
+
+    image_dir = os.path.join(
+        data_root, "celeba", "img_align_celeba", "img_align_celeba"
+    )
+
+    txt_path = os.path.join(data_root, "celeba", "list_attr_celeba.txt")
+    csv_path = os.path.join(data_root, "celeba", "list_attr_celeba.csv")
+
+    if os.path.exists(txt_path):
+        attr_path = txt_path
+    elif os.path.exists(csv_path):
+        attr_path = csv_path
+    else:
+        raise FileNotFoundError("Arquivo de atributos não encontrado em " + data_root)
+
+    dataset = CelebALatentIdentityDataset(
+        latent_dir=latent_dir,
+        attr_path=attr_path,
+        image_dir=image_dir,
+        arcface_dir=None,
+    )
+
+    total      = len(dataset)
+    train_size = int(0.70 * total)
+    val_size   = int(0.15 * total)
+    test_size  = total - train_size - val_size
+
+    _, _, test_dataset = torch.utils.data.random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    print(f"Split de teste: {len(test_dataset)} amostras")
+
+    rng     = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(test_dataset), generator=rng)[:n].tolist()
+
+    samples = []
+    for idx in indices:
+        _, attrs, ref_img = test_dataset[idx]   # (latent ignorado)
+        samples.append((ref_img, attrs))
+
+    return samples
 
 
 def load_image(path):
@@ -355,7 +404,95 @@ def generate(args):
     )
 
     # ========================================================
-    # IMAGEM DE REFERÊNCIA → CONTEXT
+    # MODO: AMOSTRAS DO TESTE
+    # ========================================================
+
+    if args.from_test:
+
+        print(f"\nModo --from_test  seed={args.seed}  n={args.n}")
+        print(f"enable={args.enable}  disable={args.disable}\n")
+
+        samples = _load_test_samples(
+            n=args.n,
+            seed=args.seed,
+            data_root=args.data_root,
+            latent_dir=args.latent_dir,
+        )
+
+        orig_imgs = []
+        gen_imgs  = []
+
+        for i, (ref_cpu, attrs_cpu) in enumerate(samples):
+
+            print(f"\n--- Amostra {i+1}/{args.n} ---")
+
+            ref_img = ref_cpu.unsqueeze(0).to(device)           # [1, 3, 256, 256]
+
+            with torch.no_grad():
+                img_context = image_encoder(ref_img)            # [1, 512, T]
+
+            # atributos do dataset + edições
+            attrs_vec = attrs_cpu.clone()
+
+            for name in (args.enable or []):
+                if name not in ATTR_TO_IDX:
+                    raise ValueError(f"Atributo desconhecido: '{name}'")
+                attrs_vec[ATTR_TO_IDX[name]] = 1.0
+                print(f"  + {name}")
+
+            for name in (args.disable or []):
+                if name not in ATTR_TO_IDX:
+                    raise ValueError(f"Atributo desconhecido: '{name}'")
+                attrs_vec[ATTR_TO_IDX[name]] = 0.0
+                print(f"  - {name}")
+
+            active = [CELEBA_ATTRS[j] for j in range(40) if attrs_vec[j] == 1.0]
+            print(f"  atributos finais: {active}")
+
+            attrs = attrs_vec.unsqueeze(0).to(device)           # [1, 40]
+
+            print(
+                f"  CFG img={args.cfg_scale_img}  CG attr={args.cg_scale_attr}"
+                + (f"  (CG ativo para t≤{args.cg_t_thresh})" if args.cg_t_thresh else "")
+            )
+
+            sampled_latent = sample_hybrid(
+                unet=unet,
+                classifier=classifier,
+                diffusion=diffusion,
+                img_context=img_context,
+                attrs=attrs,
+                n=1,
+                channels=4,
+                cfg_scale_img=args.cfg_scale_img,
+                cg_scale_attr=args.cg_scale_attr,
+                cg_t_thresh=args.cg_t_thresh,
+                device=device,
+            )
+
+            with torch.no_grad():
+                gen_img = vae.decode(sampled_latent / 0.18215)
+
+            orig_imgs.append(((ref_cpu.clamp(-1, 1) + 1) / 2).cpu())
+            gen_imgs.append(((gen_img.squeeze(0).clamp(-1, 1) + 1) / 2).cpu())
+
+        # grid: orig1 gen1 / orig2 gen2 / ...
+        grid_imgs = []
+        for o, g in zip(orig_imgs, gen_imgs):
+            grid_imgs.append(o)
+            grid_imgs.append(g)
+
+        grid = torch.stack(grid_imgs)
+
+        os.makedirs(args.save_dir, exist_ok=True)
+        out_path = os.path.join(args.save_dir, f"test_seed{args.seed}.png")
+        save_image(grid, out_path, nrow=2)
+
+        print(f"\nSalvo em: {out_path}")
+        return
+
+    # ========================================================
+    # MODO: IMAGEM DE REFERÊNCIA MANUAL
     # ========================================================
 
     print(f"Carregando referência: {args.ref_image}")
@@ -470,8 +607,37 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ref_image",
         type=str,
-        required=True,
-        help="Foto de referência da pessoa (identidade e atributos base).",
+        default=None,
+        help="Foto de referência da pessoa (identidade e atributos base). "
+             "Ignorado quando --from_test é usado.",
+    )
+
+    parser.add_argument(
+        "--from_test",
+        action="store_true",
+        help="Sorteia n imagens aleatórias do split de teste e gera pares "
+             "original | gerada lado a lado.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed para sortear as imagens do teste (--from_test).",
+    )
+
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="./CelebA_data",
+        help="Raiz do dataset CelebA (usado em --from_test).",
+    )
+
+    parser.add_argument(
+        "--latent_dir",
+        type=str,
+        default="./cache_latent",
+        help="Diretório com os latentes pré-computados (usado em --from_test).",
     )
 
     parser.add_argument(
@@ -585,5 +751,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if not args.from_test and args.ref_image is None:
+        parser.error("Informe --ref_image ou use --from_test.")
 
     generate(args)
