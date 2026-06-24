@@ -43,7 +43,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.unet_conditional import UNet_cond
-from models.encoders import ImageConditionEncoder, AttributePredictor
+from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder, AttributePredictor
 from models.modules import NoisyLatentAttrClassifier
 from diffusion.conditional_ddpm import Diffusion_conditional
 from vae.modules import VAE
@@ -104,10 +104,11 @@ class _LegacyImageConditionEncoder(nn.Module):
 # ============================================================
 
 def _detect_encoder_type(enc_state_dict):
-    """Returns 'clip_arcface' for new encoder, 'resnet' for legacy."""
-    for k in enc_state_dict:
-        if k.startswith("clip."):
-            return "clip_arcface"
+    keys = list(enc_state_dict.keys())
+    if any(k.startswith("clip.") for k in keys):
+        return "clip_arcface"
+    if any(k.startswith("id_proj.") for k in keys):
+        return "arcface_only"
     return "resnet"
 
 
@@ -364,11 +365,17 @@ def generate(args):
     enc_type = _detect_encoder_type(enc_sd)
 
     if enc_type == "clip_arcface":
-        print("  encoder: CLIP + ArcFace (novo)")
+        print("  encoder: CLIP + ArcFace")
         image_encoder = ImageConditionEncoder(
             context_dim=512,
             num_tokens=num_img_tokens,
             freeze_backbone=True,
+        ).to(device)
+    elif enc_type == "arcface_only":
+        print("  encoder: ArcFace only (identity only)")
+        image_encoder = ArcFaceOnlyEncoder(
+            context_dim=512,
+            num_tokens=num_img_tokens,
         ).to(device)
     else:
         print("  encoder: ResNet-18 (legado)")

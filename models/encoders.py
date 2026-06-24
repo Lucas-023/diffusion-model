@@ -187,10 +187,53 @@ class ArcFaceEncoder(nn.Module):
 
 
 # =========================================================
-# IMAGE CONDITION ENCODER  (IP-Adapter style, sem ArcFace)
+# ARCFACE-ONLY ENCODER
+# Usa apenas ArcFace — sem CLIP.
+# Vantagem: não captura expressão, permitindo edição livre
+# de atributos via Classifier Guidance na inferência.
 # =========================================================
 
+class ArcFaceOnlyEncoder(nn.Module):
+    """
+    Encoder de identidade usando exclusivamente ArcFace.
 
+    Input : ref_img [B, 3, H, W] em [-1, 1]  OU  id_emb [B, 512] (cache)
+    Output: [B, context_dim, num_tokens]
+    """
+
+    def __init__(self, context_dim=512, num_tokens=16):
+        super().__init__()
+        self.num_tokens  = num_tokens
+        self.context_dim = context_dim
+
+        self.arcface = ArcFaceEncoder()  # sempre frozen (ONNX)
+
+        self.id_proj = nn.Sequential(
+            nn.Linear(512, context_dim * num_tokens),
+            nn.GELU(),
+        )
+        self.id_norm = nn.LayerNorm(context_dim)
+
+    def forward(self, ref_img=None, id_emb=None, **_ignored):
+        """
+        Aceita **_ignored para ser drop-in do ImageConditionEncoder
+        (clip_tokens_raw e outros kwargs são silenciosamente ignorados).
+        """
+        if id_emb is None:
+            assert ref_img is not None, "Precisa de ref_img ou id_emb."
+            with torch.no_grad():
+                id_emb = self.arcface(ref_img)          # [B, 512]
+
+        B      = id_emb.shape[0]
+        tokens = self.id_proj(id_emb)                   # [B, C*T]
+        tokens = tokens.view(B, self.num_tokens, self.context_dim)
+        tokens = self.id_norm(tokens)                   # [B, T, C]
+        return tokens.permute(0, 2, 1)                  # [B, C, T]
+
+
+# =========================================================
+# IMAGE CONDITION ENCODER  (IP-Adapter style, CLIP + ArcFace)
+# =========================================================
 
 class ImageConditionEncoder(nn.Module):
 
