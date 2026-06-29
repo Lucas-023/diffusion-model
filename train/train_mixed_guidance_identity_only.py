@@ -424,12 +424,12 @@ def train(args):
     if is_master:
         from PIL import Image as PILImage
 
-        train_base = train_loader.dataset.dataset
+        val_base = val_loader.dataset.dataset
 
         samples_fixed = []
-        for _i in range(min(16, len(train_loader.dataset))):
-            real_idx = train_loader.dataset.indices[_i]
-            sample   = train_base[real_idx]
+        for _i in range(min(16, len(val_loader.dataset))):
+            real_idx = val_loader.dataset.indices[_i]
+            sample   = val_base[real_idx]
 
             if use_cache:
                 _, _attrs, _ref, _idemb, _ = sample   # clip ignorado
@@ -437,11 +437,11 @@ def train(args):
                 _, _attrs, _ref = sample
                 _idemb = None
 
-            _fname = train_base.samples[real_idx][0]
+            _fname = val_base.samples[real_idx][0]
             _img   = PILImage.open(
-                os.path.join(train_base.image_dir, _fname)
+                os.path.join(val_base.image_dir, _fname)
             ).convert("RGB")
-            _orig = train_base.transform(_img)
+            _orig = val_base.transform(_img)
 
             samples_fixed.append((_ref, _orig, _attrs, _idemb))
 
@@ -498,7 +498,12 @@ def train(args):
             attrs   = attrs.to(device,   non_blocking=True)
             ref_img = ref_img.to(device,  non_blocking=True)
 
-            t = diffusion.sample_timesteps(latents.shape[0]).to(device)
+            # Amostragem enviesada para t alto: u^0.5 com u~Uniform(0,1) produz
+            # distribuição com PDF 2x em [0,1], concentrando mais samples perto de
+            # noise_steps. O classificador precisa aprender a distinguir atributos
+            # em latentes ruidosos (t alto), onde seu gradiente é usado na inferência.
+            _u = torch.rand(latents.shape[0], device=device)
+            t = (_u.sqrt() * diffusion.noise_steps).long().clamp(1, diffusion.noise_steps - 1)
 
             with torch.no_grad():
                 z_t, noise = diffusion.noise_images(latents, t)
