@@ -4,8 +4,9 @@
 # Permite que o Git navegue pelas pastas
 !*/
 
-# Apenas arquivos .py sobem
+# Apenas arquivos .py e notebooks sobem
 !*.py
+!*.ipynb
 
 # Bloqueia explicitamente o que não deve subir nunca
 __pycache__/
