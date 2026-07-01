@@ -302,7 +302,7 @@ class ImageConditionEncoder(nn.Module):
             ).view(1, 3, 1, 1)
         )
 
-    def forward(self, ref_img=None, id_emb=None, clip_tokens_raw=None):
+    def forward(self, ref_img=None, id_emb=None, clip_tokens_raw=None, return_separate=False):
         """
         Modo live (treino sem cache):
             ref_img : [B, 3, H, W] em [-1, 1]   → roda CLIP + ArcFace
@@ -310,6 +310,12 @@ class ImageConditionEncoder(nn.Module):
             id_emb          : [B, 512]          → ArcFace pré-computado
             clip_tokens_raw : [B, seq_len, 768] → tokens CLIP pré-computados (CLS removido)
         Pode-se também passar só um dos dois cacheados (o outro roda live).
+
+        return_separate=True devolve (clip_tokens, id_tokens) separados em
+        vez de concatenados — usado pelo modo de CFG composable com CLIP e
+        ArcFace como ramos independentes (ver train_cfg_composable_paired.py,
+        --encoder clip_arcface_split). Não muda nenhum peso treinável, só o
+        formato do retorno.
         """
 
         # -----------------------------------------------------
@@ -366,6 +372,10 @@ class ImageConditionEncoder(nn.Module):
                         self.context_dim
                     )
         id_tokens = self.id_norm(id_tokens)
+
+        if return_separate:
+            # [B,T,C] -> [B,C,T], cada ramo isolado (sem fusão entre eles)
+            return clip_tokens.permute(0, 2, 1), id_tokens.permute(0, 2, 1)
 
         # -----------------------------------------------------
         # concat

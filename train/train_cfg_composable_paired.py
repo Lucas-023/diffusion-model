@@ -48,6 +48,7 @@ sys.path.append(
     )
 )
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,6 +68,15 @@ from models.unet_conditional import UNet_cond
 from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder
 from models.modules import AttributeEmbedder
 from vae.modules import VAE
+
+from utils.fid import (
+    InceptionFeatureExtractor,
+    calculate_activation_statistics,
+    calculate_frechet_distance,
+    compute_real_activations_streamed,
+    compute_fake_activations_batched,
+    compute_fake_activations_batched_n,
+)
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -147,6 +157,27 @@ def cfg_masks(batch_size, p_id_only, p_attr_only, p_both, device):
 
 
 # =========================================================
+# CFG DROPOUT INDEPENDENTE — modo split (3 ramos: ArcFace, CLIP, attr)
+# =========================================================
+#
+# Diferente de cfg_masks (partição categórica sobre 2 ramos), aqui cada
+# ramo é sorteado de forma independente (Bernoulli por ramo, por amostra).
+# Com 3 ramos independentes uma partição categórica exigiria especificar
+# 8 probabilidades à mão; sorteio independente é o padrão mais comum em
+# composable diffusion multi-condicionante e ainda garante que todas as
+# combinações aparecem no treino, só que sem frequências exatas impostas.
+# =========================================================
+
+def cfg_masks_split(batch_size, p_drop_id, p_drop_clip, p_drop_attr, device):
+
+    keep_id   = (torch.rand(batch_size, device=device) >= p_drop_id).float().view(-1, 1, 1)
+    keep_clip = (torch.rand(batch_size, device=device) >= p_drop_clip).float().view(-1, 1, 1)
+    keep_attr = (torch.rand(batch_size, device=device) >= p_drop_attr).float().view(-1, 1, 1)
+
+    return keep_id, keep_clip, keep_attr
+
+
+# =========================================================
 # BUILD CONTEXT
 # =========================================================
 
@@ -192,6 +223,53 @@ def build_context(
 
 
 # =========================================================
+# BUILD CONTEXT — modo split (ArcFace, CLIP e attr como ramos
+# independentes de CFG, em vez de ArcFace+CLIP fundidos num "id" só)
+# =========================================================
+
+def build_context_split(
+    image_encoder,
+    attribute_embedder,
+    attrs,
+    ref_img=None,
+    id_emb=None,
+    clip_tokens_raw=None,
+    keep_id_mask=None,
+    keep_clip_mask=None,
+    keep_attr_mask=None,
+):
+    """
+    Monta context = concat([id_tokens, clip_tokens, attr_tokens], dim=tokens).
+
+    image_encoder deve ser um ImageConditionEncoder (clip_arcface) chamado
+    com return_separate=True — ArcFace (identidade pura) e CLIP (aparência/
+    estilo da referência) saem como tensores distintos, cada um com seu
+    próprio dropout de CFG independente.
+    """
+
+    clip_tokens, id_tokens = image_encoder(
+        ref_img=ref_img,
+        id_emb=id_emb,
+        clip_tokens_raw=clip_tokens_raw,
+        return_separate=True,
+    )
+    # id_tokens, clip_tokens: [B, C, T_img]
+
+    attr_tokens = attribute_embedder(attrs)
+    # attr_tokens: [B, C, 40]
+
+    if keep_id_mask is not None:
+        id_tokens = id_tokens * keep_id_mask
+    if keep_clip_mask is not None:
+        clip_tokens = clip_tokens * keep_clip_mask
+    if keep_attr_mask is not None:
+        attr_tokens = attr_tokens * keep_attr_mask
+
+    context = torch.cat([id_tokens, clip_tokens, attr_tokens], dim=2)
+    return context
+
+
+# =========================================================
 # COMPOSABLE CFG SAMPLING
 # =========================================================
 #
@@ -204,7 +282,7 @@ def build_context(
 # =========================================================
 
 @torch.no_grad()
-def _sample_composable_cfg(
+def _sample_composable_ddim(
     unet,
     diffusion,
     id_tokens_full,        # [N, C, T_id]
@@ -214,7 +292,22 @@ def _sample_composable_cfg(
     device,
     s_id=3.0,
     s_attr=5.0,
+    ddim_steps=50,
+    eta=0.0,
 ):
+    """
+    Composable CFG (Liu et al. 2022) + amostrador DDIM (Song et al. 2020).
+
+    Substitui a amostragem ancestral (999 passos, 3 forwards de UNet cada)
+    por um sub-conjunto de `ddim_steps` timesteps com update determinístico
+    (eta=0) ou parcialmente estocástico (eta>0). Isso é usado só nas
+    avaliações periódicas (samples de visualização e FID) — o treino em si
+    (loss de denoising) não muda em nada.
+
+    O modelo nunca é chamado em t=0 (sample_timesteps só sorteia t em
+    [1, noise_steps) no treino); o último salto do DDIM vai direto para
+    alpha_bar=1 (imagem limpa) usando a predição de x0 do último passo real.
+    """
     unet.eval()
     img_size = diffusion.img_size
     z_t      = torch.randn(n, channels, img_size, img_size, device=device)
@@ -226,13 +319,12 @@ def _sample_composable_cfg(
     ctx_iu = torch.cat([id_tokens_full, zeros_attr],       dim=2)  # id, ∅
     ctx_ia = torch.cat([id_tokens_full, attr_tokens_full], dim=2)  # id, attr
 
-    for i in reversed(range(1, diffusion.noise_steps)):
+    step_size = max(diffusion.noise_steps // ddim_steps, 1)
+    times     = list(range(1, diffusion.noise_steps, step_size))[::-1]
 
-        t_vec = torch.full((n,), i, device=device, dtype=torch.long)
+    for idx, t in enumerate(times):
 
-        alpha_hat_t = diffusion.alpha_hat[t_vec][:, None, None, None]
-        alpha_t     = diffusion.alpha[t_vec][:, None, None, None]
-        beta_t      = diffusion.beta[t_vec][:, None, None, None]
+        t_vec = torch.full((n,), t, device=device, dtype=torch.long)
 
         eps_uu = unet(z_t, t_vec, context=ctx_uu)
         eps_iu = unet(z_t, t_vec, context=ctx_iu)
@@ -240,11 +332,110 @@ def _sample_composable_cfg(
 
         eps = eps_uu + s_id * (eps_iu - eps_uu) + s_attr * (eps_ia - eps_iu)
 
-        noise = torch.randn_like(z_t) if i > 1 else torch.zeros_like(z_t)
-        z_t = (
-            (1.0 / torch.sqrt(alpha_t))
-            * (z_t - (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t) * eps)
-        ) + torch.sqrt(beta_t) * noise
+        alpha_bar_t = diffusion.alpha_hat[t]
+
+        is_last = (idx == len(times) - 1)
+        alpha_bar_next = (
+            torch.tensor(1.0, device=device) if is_last
+            else diffusion.alpha_hat[times[idx + 1]]
+        )
+
+        pred_x0 = (z_t - torch.sqrt(1.0 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+
+        sigma = eta * torch.sqrt(
+            (1.0 - alpha_bar_next) / (1.0 - alpha_bar_t)
+            * (1.0 - alpha_bar_t / alpha_bar_next)
+        )
+        dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_bar_next - sigma ** 2, min=0.0)) * eps
+        noise  = torch.randn_like(z_t) if (eta > 0 and not is_last) else torch.zeros_like(z_t)
+
+        z_t = torch.sqrt(alpha_bar_next) * pred_x0 + dir_xt + sigma * noise
+
+    return z_t
+
+
+# =========================================================
+# COMPOSABLE CFG SAMPLING — modo split (ArcFace, CLIP, attr)
+# =========================================================
+#
+# eps = eps(∅,∅,∅)
+#     + s_id   * [eps(id,∅,∅)      − eps(∅,∅,∅)]
+#     + s_clip * [eps(id,clip,∅)   − eps(id,∅,∅)]
+#     + s_attr * [eps(id,clip,attr) − eps(id,clip,∅)]
+#
+# Cadeia: identidade (ArcFace) primeiro, depois aparência/estilo da
+# referência (CLIP), depois atributos — cada termo mede "dado tudo antes
+# dele, o quanto esse ramo desloca eps". s_clip=0 remove inteiramente a
+# aparência/estilo da referência (a fonte do vazamento que atrapalha
+# edições estruturais como Bald), mantendo identidade (ArcFace) + atributo.
+# =========================================================
+
+@torch.no_grad()
+def _sample_split_ddim(
+    unet,
+    diffusion,
+    id_tokens_full,        # [N, C, T_img]  (ArcFace)
+    clip_tokens_full,      # [N, C, T_img]  (CLIP)
+    attr_tokens_full,      # [N, C, 40]
+    n,
+    channels,
+    device,
+    s_id=3.0,
+    s_clip=3.0,
+    s_attr=5.0,
+    ddim_steps=50,
+    eta=0.0,
+):
+    unet.eval()
+    img_size = diffusion.img_size
+    z_t      = torch.randn(n, channels, img_size, img_size, device=device)
+
+    zeros_id   = torch.zeros_like(id_tokens_full)
+    zeros_clip = torch.zeros_like(clip_tokens_full)
+    zeros_attr = torch.zeros_like(attr_tokens_full)
+
+    ctx_000 = torch.cat([zeros_id,       zeros_clip,       zeros_attr],       dim=2)
+    ctx_i00 = torch.cat([id_tokens_full, zeros_clip,       zeros_attr],       dim=2)
+    ctx_ic0 = torch.cat([id_tokens_full, clip_tokens_full, zeros_attr],       dim=2)
+    ctx_ica = torch.cat([id_tokens_full, clip_tokens_full, attr_tokens_full], dim=2)
+
+    step_size = max(diffusion.noise_steps // ddim_steps, 1)
+    times     = list(range(1, diffusion.noise_steps, step_size))[::-1]
+
+    for idx, t in enumerate(times):
+
+        t_vec = torch.full((n,), t, device=device, dtype=torch.long)
+
+        eps_000 = unet(z_t, t_vec, context=ctx_000)
+        eps_i00 = unet(z_t, t_vec, context=ctx_i00)
+        eps_ic0 = unet(z_t, t_vec, context=ctx_ic0)
+        eps_ica = unet(z_t, t_vec, context=ctx_ica)
+
+        eps = (
+            eps_000
+            + s_id   * (eps_i00 - eps_000)
+            + s_clip * (eps_ic0 - eps_i00)
+            + s_attr * (eps_ica - eps_ic0)
+        )
+
+        alpha_bar_t = diffusion.alpha_hat[t]
+
+        is_last = (idx == len(times) - 1)
+        alpha_bar_next = (
+            torch.tensor(1.0, device=device) if is_last
+            else diffusion.alpha_hat[times[idx + 1]]
+        )
+
+        pred_x0 = (z_t - torch.sqrt(1.0 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+
+        sigma = eta * torch.sqrt(
+            (1.0 - alpha_bar_next) / (1.0 - alpha_bar_t)
+            * (1.0 - alpha_bar_t / alpha_bar_next)
+        )
+        dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_bar_next - sigma ** 2, min=0.0)) * eps
+        noise  = torch.randn_like(z_t) if (eta > 0 and not is_last) else torch.zeros_like(z_t)
+
+        z_t = torch.sqrt(alpha_bar_next) * pred_x0 + dir_xt + sigma * noise
 
     return z_t
 
@@ -309,13 +500,17 @@ def train(args):
     # IDENTITY ENCODER
     # =====================================================
 
-    if args.encoder == "clip_arcface":
+    if args.encoder in ("clip_arcface", "clip_arcface_split"):
         image_encoder = ImageConditionEncoder(
             context_dim=context_dim,
             num_tokens=num_img_tokens,
             freeze_backbone=True,
         ).to(device)
-        # tokens reais: 2 * num_img_tokens (clip + arcface concatenados)
+        # tokens reais: 2 * num_img_tokens (clip + arcface); em
+        # "clip_arcface_split" os dois ramos são chamados com
+        # return_separate=True e viram condicionantes independentes de
+        # CFG em vez de ficarem concatenados como um "id" só — mesma
+        # classe/pesos de "clip_arcface", checkpoints intercambiáveis.
     elif args.encoder == "arcface_only":
         image_encoder = ArcFaceOnlyEncoder(
             context_dim=context_dim,
@@ -488,16 +683,41 @@ def train(args):
     fixed_ref_imgs = None
 
     # =====================================================
-    # FIXED SAMPLES
+    # FIXED SAMPLES  (+ condicionamento do lado GERADO do FID)
     # =====================================================
+    #
+    # Reaproveita o mesmo laço de carregamento: os 16 primeiros elementos
+    # viram as amostras fixas de visualização (originals.jpg / smile), até
+    # --fid_num_samples elementos viram o condicionamento do lado GERADO
+    # do FID. As estatísticas do lado REAL usam o dataset de validação
+    # inteiro, calculadas à parte (streaming, ver bloco abaixo).
+    # =====================================================
+
+    fid_extractor  = None
+    fid_mu_real    = None
+    fid_sigma_real = None
+    fid_ref_imgs   = None
+    fid_attrs      = None
+    fid_id_emb     = None
+    fid_clip       = None
+    last_fid_value = None
 
     if is_master:
         from PIL import Image as PILImage
 
         val_base = val_loader.dataset.dataset
 
+        # ---- amostras fixas (visualização) + condicionamento do lado
+        #      GERADO do FID: --fid_num_samples controla só isto — é o
+        #      lado caro (amostragem por difusão completa, repetida a
+        #      cada --fid_every épocas), então fica bem menor que o
+        #      dataset de validação inteiro. ----
+        n_fixed = min(16, len(val_loader.dataset))
+        n_fake  = min(args.fid_num_samples, len(val_loader.dataset)) if args.fid_every > 0 else 0
+        n_load  = max(n_fixed, n_fake)
+
         samples_fixed = []
-        for _i in range(min(16, len(val_loader.dataset))):
+        for _i in range(n_load):
             real_idx = val_loader.dataset.indices[_i]
             sample   = val_base[real_idx]
 
@@ -512,15 +732,15 @@ def train(args):
 
             samples_fixed.append((_ref, _orig, _attrs, _idemb, _clip))
 
-        fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed]).to(device)
-        fixed_attrs    = torch.stack([s[2] for s in samples_fixed]).to(device)
-        orig_imgs      = torch.stack([s[1] for s in samples_fixed])
+        fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed[:n_fixed]]).to(device)
+        fixed_attrs    = torch.stack([s[2] for s in samples_fixed[:n_fixed]]).to(device)
+        orig_imgs      = torch.stack([s[1] for s in samples_fixed[:n_fixed]])
 
-        fixed_id_emb = torch.stack([s[3] for s in samples_fixed]).to(device)
+        fixed_id_emb = torch.stack([s[3] for s in samples_fixed[:n_fixed]]).to(device)
 
         fixed_clip = None
-        if args.encoder == "clip_arcface" and samples_fixed[0][4] is not None:
-            fixed_clip = torch.stack([s[4] for s in samples_fixed]).to(device)
+        if args.encoder in ("clip_arcface", "clip_arcface_split") and samples_fixed[0][4] is not None:
+            fixed_clip = torch.stack([s[4] for s in samples_fixed[:n_fixed]]).to(device)
 
         # nota: fixed_ref_imgs aqui já é a referência PAREADA (outra foto),
         # não a mesma foto de orig_imgs — é esperado que fiquem diferentes
@@ -536,6 +756,90 @@ def train(args):
             nrow=4,
         )
         print("Originais salvas em originals.jpg, referências pareadas em references_paired.jpg")
+
+        # -------------------------------------------------
+        # FID: condicionamento para o lado GERADO (n_fake imagens,
+        # recriadas pelo EMA a cada avaliação)
+        # -------------------------------------------------
+
+        if args.fid_every > 0:
+
+            fid_ref_imgs = torch.stack([s[0] for s in samples_fixed[:n_fake]]).to(device)
+            fid_attrs    = torch.stack([s[2] for s in samples_fixed[:n_fake]]).to(device)
+            fid_id_emb   = torch.stack([s[3] for s in samples_fixed[:n_fake]]).to(device)
+
+            fid_clip = None
+            if args.encoder in ("clip_arcface", "clip_arcface_split") and samples_fixed[0][4] is not None:
+                fid_clip = torch.stack([s[4] for s in samples_fixed[:n_fake]]).to(device)
+
+    # =====================================================
+    # FID: estatísticas REAIS — cálculo PREGUIÇOSO
+    # =====================================================
+    #
+    # Passar todo o conjunto de validação pela InceptionV3 só compensa se
+    # o treino de fato chegar a usar FID — com --fid_start_epoch, os
+    # primeiros epochs (modelo ainda gerando ruído/rostos incoerentes,
+    # FID não é informativo) são pulados, então adiamos esse custo para a
+    # primeira vez que ele for realmente necessário, dentro do loop. Assim,
+    # se o treino for interrompido antes de --fid_start_epoch, esse custo
+    # nunca é pago.
+    # =====================================================
+
+    def _ensure_fid_real_stats():
+        nonlocal fid_mu_real, fid_sigma_real, fid_extractor
+
+        if fid_mu_real is not None:
+            return
+
+        n_real = len(val_loader.dataset)
+
+        if fid_extractor is None:
+            fid_extractor = InceptionFeatureExtractor(device=device)
+
+        # Cache em disco: sem isso, todo --resume_ckpt repetiria esse
+        # custo do zero.
+        fid_cache_path = os.path.join(save_dir, "fid_real_stats.npz")
+
+        if os.path.isfile(fid_cache_path):
+
+            cached = np.load(fid_cache_path)
+
+            if int(cached["n_real"]) == n_real:
+                fid_mu_real    = cached["mu"]
+                fid_sigma_real = cached["sigma"]
+                print(f"[FID] Estatísticas reais carregadas do cache "
+                      f"({fid_cache_path}, {n_real} imagens).")
+                return
+            else:
+                print(f"[FID] Cache em {fid_cache_path} tem n_real="
+                      f"{int(cached['n_real'])}, mas o split atual tem "
+                      f"{n_real} — recalculando.")
+
+        def _load_real_chunk(start, end):
+            imgs = []
+            for _i in range(start, end):
+                real_idx = val_loader.dataset.indices[_i]
+                fname    = val_base.samples[real_idx][0]
+                img      = PILImage.open(
+                    os.path.join(val_base.image_dir, fname)
+                ).convert("RGB")
+                imgs.append(val_base.transform(img))
+            return torch.stack(imgs)
+
+        print(f"[FID] Extraindo features InceptionV3 de {n_real} imagens reais "
+              f"(todo o conjunto de validação, uma vez)...")
+        real_acts = compute_real_activations_streamed(
+            _load_real_chunk, n_real, fid_extractor, chunk_size=args.fid_real_batch_size
+        )
+        fid_mu_real, fid_sigma_real = calculate_activation_statistics(real_acts)
+
+        np.savez(
+            fid_cache_path,
+            mu=fid_mu_real,
+            sigma=fid_sigma_real,
+            n_real=n_real,
+        )
+        print(f"[FID] Estatísticas reais salvas em {fid_cache_path}.")
 
     # =====================================================
     # TRAIN LOOP
@@ -563,7 +867,7 @@ def train(args):
 
             latents, attrs, ref_img, id_emb, clip_tokens = batch
             id_emb      = id_emb.to(device, non_blocking=True)
-            clip_tokens = clip_tokens.to(device, non_blocking=True) if args.encoder == "clip_arcface" else None
+            clip_tokens = clip_tokens.to(device, non_blocking=True) if args.encoder in ("clip_arcface", "clip_arcface_split") else None
 
             latents = latents.to(device, non_blocking=True)
             attrs   = attrs.to(device,   non_blocking=True)
@@ -577,13 +881,22 @@ def train(args):
                 z_t, noise = diffusion.noise_images(latents, t)
 
             # ---- máscaras de dropout independentes por amostra ----
-            keep_id, keep_attr = cfg_masks(
-                B,
-                p_id_only=args.cfg_dropout_id_only,
-                p_attr_only=args.cfg_dropout_attr_only,
-                p_both=args.cfg_dropout_both,
-                device=device,
-            )
+            if args.encoder == "clip_arcface_split":
+                keep_id, keep_clip, keep_attr = cfg_masks_split(
+                    B,
+                    p_drop_id=args.split_dropout_id,
+                    p_drop_clip=args.split_dropout_clip,
+                    p_drop_attr=args.split_dropout_attr,
+                    device=device,
+                )
+            else:
+                keep_id, keep_attr = cfg_masks(
+                    B,
+                    p_id_only=args.cfg_dropout_id_only,
+                    p_attr_only=args.cfg_dropout_attr_only,
+                    p_both=args.cfg_dropout_both,
+                    device=device,
+                )
 
             is_accumulating = (
                 (i + 1) % accumulation_steps != 0
@@ -598,17 +911,30 @@ def train(args):
 
             with ctx_managers[0], ctx_managers[1], ctx_managers[2]:
                 with autocast():
-                    context = build_context(
-                        image_encoder=image_encoder,
-                        attribute_embedder=attribute_embedder,
-                        attrs=attrs,
-                        ref_img=ref_img,
-                        id_emb=id_emb,
-                        clip_tokens_raw=clip_tokens,
-                        encoder_type=args.encoder,
-                        keep_id_mask=keep_id,
-                        keep_attr_mask=keep_attr,
-                    )
+                    if args.encoder == "clip_arcface_split":
+                        context = build_context_split(
+                            image_encoder=image_encoder,
+                            attribute_embedder=attribute_embedder,
+                            attrs=attrs,
+                            ref_img=ref_img,
+                            id_emb=id_emb,
+                            clip_tokens_raw=clip_tokens,
+                            keep_id_mask=keep_id,
+                            keep_clip_mask=keep_clip,
+                            keep_attr_mask=keep_attr,
+                        )
+                    else:
+                        context = build_context(
+                            image_encoder=image_encoder,
+                            attribute_embedder=attribute_embedder,
+                            attrs=attrs,
+                            ref_img=ref_img,
+                            id_emb=id_emb,
+                            clip_tokens_raw=clip_tokens,
+                            encoder_type=args.encoder,
+                            keep_id_mask=keep_id,
+                            keep_attr_mask=keep_attr,
+                        )
 
                     predicted_noise = model(z_t, t, context=context)
                     loss = F.mse_loss(predicted_noise, noise)
@@ -652,7 +978,7 @@ def train(args):
 
                 latents, attrs, ref_img, id_emb, clip_tokens = batch
                 id_emb      = id_emb.to(device, non_blocking=True)
-                clip_tokens = clip_tokens.to(device, non_blocking=True) if args.encoder == "clip_arcface" else None
+                clip_tokens = clip_tokens.to(device, non_blocking=True) if args.encoder in ("clip_arcface", "clip_arcface_split") else None
 
                 latents = latents.to(device, non_blocking=True)
                 attrs   = attrs.to(device,   non_blocking=True)
@@ -664,15 +990,25 @@ def train(args):
                     z_t, noise = diffusion.noise_images(latents, t)
 
                     # validação SEM dropout — mede a likelihood condicionada
-                    context = build_context(
-                        image_encoder=image_encoder,
-                        attribute_embedder=attribute_embedder,
-                        attrs=attrs,
-                        ref_img=ref_img,
-                        id_emb=id_emb,
-                        clip_tokens_raw=clip_tokens,
-                        encoder_type=args.encoder,
-                    )
+                    if args.encoder == "clip_arcface_split":
+                        context = build_context_split(
+                            image_encoder=image_encoder,
+                            attribute_embedder=attribute_embedder,
+                            attrs=attrs,
+                            ref_img=ref_img,
+                            id_emb=id_emb,
+                            clip_tokens_raw=clip_tokens,
+                        )
+                    else:
+                        context = build_context(
+                            image_encoder=image_encoder,
+                            attribute_embedder=attribute_embedder,
+                            attrs=attrs,
+                            ref_img=ref_img,
+                            id_emb=id_emb,
+                            clip_tokens_raw=clip_tokens,
+                            encoder_type=args.encoder,
+                        )
 
                     predicted_noise = model(z_t, t, context=context)
                     v_loss = F.mse_loss(predicted_noise, noise)
@@ -732,6 +1068,7 @@ def train(args):
                     "num_img_tokens":                     num_img_tokens,
                     "encoder":                            args.encoder,
                     "ref_pairing":                         "identity",
+                    "fid":                                last_fid_value,
                 }
 
                 if save_periodic:
@@ -756,10 +1093,19 @@ def train(args):
 
             with torch.no_grad():
 
+                clip_tok = None
+
                 if args.encoder == "arcface_only":
                     id_tok = ema_image_encoder(
                         ref_img=fixed_ref_imgs,
                         id_emb=fixed_id_emb,
+                    )
+                elif args.encoder == "clip_arcface_split":
+                    clip_tok, id_tok = ema_image_encoder(
+                        ref_img=fixed_ref_imgs,
+                        id_emb=fixed_id_emb,
+                        clip_tokens_raw=fixed_clip,
+                        return_separate=True,
                     )
                 else:
                     id_tok = ema_image_encoder(
@@ -770,19 +1116,38 @@ def train(args):
 
                 attr_tok = ema_attribute_embedder(fixed_attrs)
 
+                def _sample(attr_tokens):
+                    if args.encoder == "clip_arcface_split":
+                        return _sample_split_ddim(
+                            unet=ema_model,
+                            diffusion=diffusion,
+                            id_tokens_full=id_tok,
+                            clip_tokens_full=clip_tok,
+                            attr_tokens_full=attr_tokens,
+                            n=fixed_ref_imgs.shape[0],
+                            channels=latent_dim,
+                            device=device,
+                            s_id=args.s_id_val,
+                            s_clip=args.s_clip_val,
+                            s_attr=args.s_attr_val,
+                            ddim_steps=args.ddim_steps,
+                        )
+                    return _sample_composable_ddim(
+                        unet=ema_model,
+                        diffusion=diffusion,
+                        id_tokens_full=id_tok,
+                        attr_tokens_full=attr_tokens,
+                        n=fixed_ref_imgs.shape[0],
+                        channels=latent_dim,
+                        device=device,
+                        s_id=args.s_id_val,
+                        s_attr=args.s_attr_val,
+                        ddim_steps=args.ddim_steps,
+                    )
+
                 # ---- atributos originais ----
                 print("Sampling (composable CFG — atributos originais)...")
-                latents_orig = _sample_composable_cfg(
-                    unet=ema_model,
-                    diffusion=diffusion,
-                    id_tokens_full=id_tok,
-                    attr_tokens_full=attr_tok,
-                    n=fixed_ref_imgs.shape[0],
-                    channels=latent_dim,
-                    device=device,
-                    s_id=args.s_id_val,
-                    s_attr=args.s_attr_val,
-                )
+                latents_orig = _sample(attr_tok)
                 images_orig = vae.decode(latents_orig / 0.18215)
 
                 save_images(images_orig, os.path.join(results_dir, f"{epoch}_attr_orig.jpg"), nrow=4)
@@ -800,17 +1165,7 @@ def train(args):
                 attr_tok_smile = ema_attribute_embedder(attrs_smile)
 
                 print("Sampling (composable CFG — Smiling=1 forçado)...")
-                latents_smile = _sample_composable_cfg(
-                    unet=ema_model,
-                    diffusion=diffusion,
-                    id_tokens_full=id_tok,
-                    attr_tokens_full=attr_tok_smile,
-                    n=fixed_ref_imgs.shape[0],
-                    channels=latent_dim,
-                    device=device,
-                    s_id=args.s_id_val,
-                    s_attr=args.s_attr_val,
-                )
+                latents_smile = _sample(attr_tok_smile)
                 images_smile = vae.decode(latents_smile / 0.18215)
 
                 save_images(images_smile, os.path.join(results_dir, f"{epoch}_attr_smile.jpg"), nrow=4)
@@ -819,6 +1174,121 @@ def train(args):
                     make_grid(images_smile, nrow=4, normalize=True, value_range=(-1, 1)),
                     epoch,
                 )
+
+        # =================================================
+        # FID  —  custoso, só a cada --fid_every épocas e só depois de
+        # --fid_start_epoch (nos primeiros epochs o modelo ainda gera
+        # ruído/rostos incoerentes — FID não é informativo, só custa
+        # tempo de treino que dá pra usar em steps de verdade).
+        # =================================================
+        #
+        # As estatísticas REAIS são calculadas (ou carregadas do cache)
+        # na primeira vez que este bloco roda de fato — ver
+        # _ensure_fid_real_stats(). Aqui só recalculamos as estatísticas
+        # do conjunto GERADO (o encoder/UNet EMA muda a cada época).
+        # =================================================
+
+        epochs_since_fid_start = epoch - args.fid_start_epoch
+
+        if (
+            is_master
+            and args.fid_every > 0
+            and epochs_since_fid_start >= 0
+            and (epochs_since_fid_start % args.fid_every == 0 or epoch == args.epochs - 1)
+        ):
+
+            _ensure_fid_real_stats()
+
+            ema_model.eval()
+            ema_image_encoder.eval()
+            ema_attribute_embedder.eval()
+
+            with torch.no_grad():
+
+                print(f"[FID] Gerando {fid_ref_imgs.shape[0]} amostras para avaliação...")
+
+                clip_tok_fid = None
+
+                if args.encoder == "arcface_only":
+                    id_tok_fid = ema_image_encoder(
+                        ref_img=fid_ref_imgs,
+                        id_emb=fid_id_emb,
+                    )
+                elif args.encoder == "clip_arcface_split":
+                    clip_tok_fid, id_tok_fid = ema_image_encoder(
+                        ref_img=fid_ref_imgs,
+                        id_emb=fid_id_emb,
+                        clip_tokens_raw=fid_clip,
+                        return_separate=True,
+                    )
+                else:
+                    id_tok_fid = ema_image_encoder(
+                        ref_img=fid_ref_imgs,
+                        id_emb=fid_id_emb,
+                        clip_tokens_raw=fid_clip,
+                    )
+
+                attr_tok_fid = ema_attribute_embedder(fid_attrs)
+
+                if args.encoder == "clip_arcface_split":
+
+                    def _gen_fid_chunk_split(id_chunk, clip_chunk, attr_chunk):
+                        lat = _sample_split_ddim(
+                            unet=ema_model,
+                            diffusion=diffusion,
+                            id_tokens_full=id_chunk,
+                            clip_tokens_full=clip_chunk,
+                            attr_tokens_full=attr_chunk,
+                            n=id_chunk.shape[0],
+                            channels=latent_dim,
+                            device=device,
+                            s_id=args.s_id_val,
+                            s_clip=args.s_clip_val,
+                            s_attr=args.s_attr_val,
+                            ddim_steps=args.ddim_steps,
+                        )
+                        return vae.decode(lat / 0.18215)
+
+                    fake_acts = compute_fake_activations_batched_n(
+                        generate_fn=_gen_fid_chunk_split,
+                        tokens_full=[id_tok_fid, clip_tok_fid, attr_tok_fid],
+                        extractor=fid_extractor,
+                        chunk_size=args.fid_batch_size,
+                    )
+
+                else:
+
+                    def _gen_fid_chunk(id_chunk, attr_chunk):
+                        lat = _sample_composable_ddim(
+                            unet=ema_model,
+                            diffusion=diffusion,
+                            id_tokens_full=id_chunk,
+                            attr_tokens_full=attr_chunk,
+                            n=id_chunk.shape[0],
+                            channels=latent_dim,
+                            device=device,
+                            s_id=args.s_id_val,
+                            s_attr=args.s_attr_val,
+                            ddim_steps=args.ddim_steps,
+                        )
+                        return vae.decode(lat / 0.18215)
+
+                    fake_acts = compute_fake_activations_batched(
+                        generate_fn=_gen_fid_chunk,
+                        id_tokens_full=id_tok_fid,
+                        attr_tokens_full=attr_tok_fid,
+                        extractor=fid_extractor,
+                        chunk_size=args.fid_batch_size,
+                    )
+
+                fid_mu_fake, fid_sigma_fake = calculate_activation_statistics(fake_acts)
+                fid_value = calculate_frechet_distance(
+                    fid_mu_real, fid_sigma_real, fid_mu_fake, fid_sigma_fake
+                )
+                last_fid_value = fid_value
+
+                print(f"[FID] Epoch {epoch}: FID = {fid_value:.3f}")
+                board.log_scalar("Metrics/FID", fid_value, epoch)
 
     if is_master:
         board.close()
@@ -844,10 +1314,17 @@ if __name__ == "__main__":
         "--encoder",
         type=str,
         default="clip_arcface",
-        choices=["clip_arcface", "arcface_only"],
+        choices=["clip_arcface", "arcface_only", "clip_arcface_split"],
         help="Encoder de identidade. Com pareamento por identidade, "
              "clip_arcface é o caso que este script existe para consertar "
-             "(CLIP não vê mais a expressão do alvo).",
+             "(CLIP não vê mais a expressão do alvo). clip_arcface_split "
+             "usa a mesma classe/pesos de clip_arcface, mas trata ArcFace "
+             "(identidade pura) e CLIP (aparência/estilo da referência) "
+             "como ramos INDEPENDENTES de CFG composable (3 termos: s_id, "
+             "s_clip, s_attr, em vez de 2) — permite zerar s_clip na "
+             "inferência para eliminar o vazamento de aparência da "
+             "referência em edições estruturais (ex.: Bald) sem perder "
+             "identidade (ArcFace) nem controle de atributo.",
     )
 
     parser.add_argument(
@@ -871,14 +1348,82 @@ if __name__ == "__main__":
              "sem header). Ver analyze_identity_variety.ipynb.",
     )
 
-    # ---- dropouts INDEPENDENTES de CFG ----
+    # ---- dropouts INDEPENDENTES de CFG (2 ramos: --encoder clip_arcface / arcface_only) ----
     parser.add_argument("--cfg_dropout_id_only",   type=float, default=0.1)
     parser.add_argument("--cfg_dropout_attr_only", type=float, default=0.1)
     parser.add_argument("--cfg_dropout_both",      type=float, default=0.1)
 
+    # ---- dropouts INDEPENDENTES de CFG (3 ramos: --encoder clip_arcface_split) ----
+    # Bernoulli por ramo, por amostra — não uma partição categórica como
+    # acima (ver cfg_masks_split).
+    parser.add_argument("--split_dropout_id",   type=float, default=0.1)
+    parser.add_argument("--split_dropout_clip", type=float, default=0.1)
+    parser.add_argument("--split_dropout_attr", type=float, default=0.1)
+
     # ---- escalas usadas só nos samples de validação ----
     parser.add_argument("--s_id_val",   type=float, default=3.0)
     parser.add_argument("--s_attr_val", type=float, default=5.0)
+    parser.add_argument(
+        "--s_clip_val", type=float, default=3.0,
+        help="Escala de guidance para o ramo CLIP (aparência/estilo da "
+             "referência) — só usado com --encoder clip_arcface_split. "
+             "Baixe para perto de 0 para edições estruturais (ex.: Bald) "
+             "onde a aparência da referência conflita com o atributo "
+             "desejado; mantenha alto para reconstrução fiel.",
+    )
+
+    parser.add_argument(
+        "--ddim_steps", type=int, default=50,
+        help="Nº de passos do amostrador DDIM usado nas avaliações "
+             "periódicas (samples de visualização e FID) — NÃO afeta o "
+             "treino (que continua treinando em t contínuo via MSE de "
+             "denoising). Substitui a amostragem ancestral de ~999 passos, "
+             "cortando o custo de cada avaliação em ~noise_steps/ddim_steps "
+             "vezes. 50 é o padrão comum na literatura (Song et al. 2020); "
+             "suba se notar degradação visual perceptível nas amostras.",
+    )
+
+    # ---- FID (custoso — só roda a cada N épocas) ----
+    parser.add_argument(
+        "--fid_every", type=int, default=10,
+        help="Calcula FID a cada N épocas a partir de --fid_start_epoch "
+             "(0 desativa). As estatísticas REAIS usam o conjunto de "
+             "validação inteiro e são calculadas (ou carregadas do cache "
+             "em disco) na primeira vez que forem necessárias; a cada "
+             "avaliação só as estatísticas do conjunto GERADO pelo EMA "
+             "mudam.",
+    )
+    parser.add_argument(
+        "--fid_start_epoch", type=int, default=0,
+        help="Só começa a calcular FID a partir deste epoch. Nos primeiros "
+             "epochs o modelo ainda gera ruído/rostos incoerentes e o FID "
+             "não é informativo — pular esse trecho economiza tempo de "
+             "amostragem (por difusão completa) que pode ir para steps de "
+             "treino de verdade. Ajuste proporcional ao seu --epochs total, "
+             "não a um valor absoluto.",
+    )
+    parser.add_argument(
+        "--fid_num_samples", type=int, default=256,
+        help="Nº de imagens GERADAS (via difusão completa) para estimar as "
+             "estatísticas do lado 'fake' do FID a cada avaliação — não "
+             "afeta o lado real, que sempre usa o split de validação "
+             "inteiro. O ideal estatístico é >=2048 (dimensão das features "
+             "da InceptionV3), mas cada unidade aqui é uma amostragem por "
+             "difusão completa repetida a cada --fid_every épocas; 256 é um "
+             "compromisso custo/estabilidade, não o ideal — suba se puder "
+             "pagar o tempo de geração extra.",
+    )
+    parser.add_argument(
+        "--fid_batch_size", type=int, default=16,
+        help="Tamanho do chunk de amostragem/inferência para o lado GERADO "
+             "do FID (controla o pico de uso de memória da difusão).",
+    )
+    parser.add_argument(
+        "--fid_real_batch_size", type=int, default=128,
+        help="Tamanho do chunk de leitura+InceptionV3 para o lado REAL do "
+             "FID (só carrega imagem + forward, sem amostragem por difusão "
+             "— pode ser bem maior que --fid_batch_size).",
+    )
 
     parser.add_argument("--resume_ckpt",    type=str, default=None)
     parser.add_argument("--warmstart_ckpt", type=str, default=None)

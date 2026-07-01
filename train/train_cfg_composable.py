@@ -34,6 +34,7 @@ sys.path.append(
     )
 )
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +54,14 @@ from models.unet_conditional import UNet_cond
 from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder
 from models.modules import AttributeEmbedder
 from vae.modules import VAE
+
+from utils.fid import (
+    InceptionFeatureExtractor,
+    calculate_activation_statistics,
+    calculate_frechet_distance,
+    compute_real_activations_streamed,
+    compute_fake_activations_batched,
+)
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -190,7 +199,7 @@ def build_context(
 # =========================================================
 
 @torch.no_grad()
-def _sample_composable_cfg(
+def _sample_composable_ddim(
     unet,
     diffusion,
     id_tokens_full,        # [N, C, T_id]
@@ -200,7 +209,22 @@ def _sample_composable_cfg(
     device,
     s_id=3.0,
     s_attr=5.0,
+    ddim_steps=50,
+    eta=0.0,
 ):
+    """
+    Composable CFG (Liu et al. 2022) + amostrador DDIM (Song et al. 2020).
+
+    Substitui a amostragem ancestral (999 passos, 3 forwards de UNet cada)
+    por um sub-conjunto de `ddim_steps` timesteps com update determinístico
+    (eta=0) ou parcialmente estocástico (eta>0). Isso é usado só nas
+    avaliações periódicas (samples de visualização e FID) — o treino em si
+    (loss de denoising) não muda em nada.
+
+    O modelo nunca é chamado em t=0 (sample_timesteps só sorteia t em
+    [1, noise_steps) no treino); o último salto do DDIM vai direto para
+    alpha_bar=1 (imagem limpa) usando a predição de x0 do último passo real.
+    """
     unet.eval()
     img_size = diffusion.img_size
     z_t      = torch.randn(n, channels, img_size, img_size, device=device)
@@ -212,13 +236,12 @@ def _sample_composable_cfg(
     ctx_iu = torch.cat([id_tokens_full, zeros_attr],       dim=2)  # id, ∅
     ctx_ia = torch.cat([id_tokens_full, attr_tokens_full], dim=2)  # id, attr
 
-    for i in reversed(range(1, diffusion.noise_steps)):
+    step_size = max(diffusion.noise_steps // ddim_steps, 1)
+    times     = list(range(1, diffusion.noise_steps, step_size))[::-1]
 
-        t_vec = torch.full((n,), i, device=device, dtype=torch.long)
+    for idx, t in enumerate(times):
 
-        alpha_hat_t = diffusion.alpha_hat[t_vec][:, None, None, None]
-        alpha_t     = diffusion.alpha[t_vec][:, None, None, None]
-        beta_t      = diffusion.beta[t_vec][:, None, None, None]
+        t_vec = torch.full((n,), t, device=device, dtype=torch.long)
 
         eps_uu = unet(z_t, t_vec, context=ctx_uu)
         eps_iu = unet(z_t, t_vec, context=ctx_iu)
@@ -226,11 +249,24 @@ def _sample_composable_cfg(
 
         eps = eps_uu + s_id * (eps_iu - eps_uu) + s_attr * (eps_ia - eps_iu)
 
-        noise = torch.randn_like(z_t) if i > 1 else torch.zeros_like(z_t)
-        z_t = (
-            (1.0 / torch.sqrt(alpha_t))
-            * (z_t - (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t) * eps)
-        ) + torch.sqrt(beta_t) * noise
+        alpha_bar_t = diffusion.alpha_hat[t]
+
+        is_last = (idx == len(times) - 1)
+        alpha_bar_next = (
+            torch.tensor(1.0, device=device) if is_last
+            else diffusion.alpha_hat[times[idx + 1]]
+        )
+
+        pred_x0 = (z_t - torch.sqrt(1.0 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+
+        sigma = eta * torch.sqrt(
+            (1.0 - alpha_bar_next) / (1.0 - alpha_bar_t)
+            * (1.0 - alpha_bar_t / alpha_bar_next)
+        )
+        dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_bar_next - sigma ** 2, min=0.0)) * eps
+        noise  = torch.randn_like(z_t) if (eta > 0 and not is_last) else torch.zeros_like(z_t)
+
+        z_t = torch.sqrt(alpha_bar_next) * pred_x0 + dir_xt + sigma * noise
 
     return z_t
 
@@ -475,16 +511,41 @@ def train(args):
     fixed_ref_imgs = None
 
     # =====================================================
-    # FIXED SAMPLES
+    # FIXED SAMPLES  (+ condicionamento do lado GERADO do FID)
     # =====================================================
+    #
+    # Reaproveita o mesmo laço de carregamento: os 16 primeiros elementos
+    # viram as amostras fixas de visualização (originals.jpg / smile), até
+    # --fid_num_samples elementos viram o condicionamento do lado GERADO
+    # do FID. As estatísticas do lado REAL usam o dataset de validação
+    # inteiro, calculadas à parte (streaming, ver bloco abaixo).
+    # =====================================================
+
+    fid_extractor  = None
+    fid_mu_real    = None
+    fid_sigma_real = None
+    fid_ref_imgs   = None
+    fid_attrs      = None
+    fid_id_emb     = None
+    fid_clip       = None
+    last_fid_value = None
 
     if is_master:
         from PIL import Image as PILImage
 
         val_base = val_loader.dataset.dataset
 
+        # ---- amostras fixas (visualização) + condicionamento do lado
+        #      GERADO do FID: --fid_num_samples controla só isto — é o
+        #      lado caro (amostragem por difusão completa, repetida a
+        #      cada --fid_every épocas), então fica bem menor que o
+        #      dataset de validação inteiro. ----
+        n_fixed  = min(16, len(val_loader.dataset))
+        n_fake   = min(args.fid_num_samples, len(val_loader.dataset)) if args.fid_every > 0 else 0
+        n_load   = max(n_fixed, n_fake)
+
         samples_fixed = []
-        for _i in range(min(16, len(val_loader.dataset))):
+        for _i in range(n_load):
             real_idx = val_loader.dataset.indices[_i]
             sample   = val_base[real_idx]
 
@@ -503,18 +564,18 @@ def train(args):
 
             samples_fixed.append((_ref, _orig, _attrs, _idemb, _clip))
 
-        fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed]).to(device)
-        fixed_attrs    = torch.stack([s[2] for s in samples_fixed]).to(device)
-        orig_imgs      = torch.stack([s[1] for s in samples_fixed])
+        fixed_ref_imgs = torch.stack([s[0] for s in samples_fixed[:n_fixed]]).to(device)
+        fixed_attrs    = torch.stack([s[2] for s in samples_fixed[:n_fixed]]).to(device)
+        orig_imgs      = torch.stack([s[1] for s in samples_fixed[:n_fixed]])
 
         fixed_id_emb = (
-            torch.stack([s[3] for s in samples_fixed]).to(device)
+            torch.stack([s[3] for s in samples_fixed[:n_fixed]]).to(device)
             if use_cache else None
         )
 
         fixed_clip = None
         if use_cache and args.encoder == "clip_arcface" and samples_fixed[0][4] is not None:
-            fixed_clip = torch.stack([s[4] for s in samples_fixed]).to(device)
+            fixed_clip = torch.stack([s[4] for s in samples_fixed[:n_fixed]]).to(device)
 
         save_images(
             orig_imgs,
@@ -522,6 +583,94 @@ def train(args):
             nrow=4,
         )
         print("Originais salvas em originals.jpg")
+
+        # -------------------------------------------------
+        # FID: condicionamento para o lado GERADO (n_fake imagens,
+        # recriadas pelo EMA a cada avaliação)
+        # -------------------------------------------------
+
+        if args.fid_every > 0:
+
+            fid_ref_imgs = torch.stack([s[0] for s in samples_fixed[:n_fake]]).to(device)
+            fid_attrs    = torch.stack([s[2] for s in samples_fixed[:n_fake]]).to(device)
+
+            fid_id_emb = (
+                torch.stack([s[3] for s in samples_fixed[:n_fake]]).to(device)
+                if use_cache else None
+            )
+
+            fid_clip = None
+            if use_cache and args.encoder == "clip_arcface" and samples_fixed[0][4] is not None:
+                fid_clip = torch.stack([s[4] for s in samples_fixed[:n_fake]]).to(device)
+
+    # =====================================================
+    # FID: estatísticas REAIS — cálculo PREGUIÇOSO
+    # =====================================================
+    #
+    # Passar todo o conjunto de validação pela InceptionV3 só compensa se
+    # o treino de fato chegar a usar FID — com --fid_start_epoch, os
+    # primeiros epochs (modelo ainda gerando ruído/rostos incoerentes,
+    # FID não é informativo) são pulados, então adiamos esse custo para a
+    # primeira vez que ele for realmente necessário, dentro do loop. Assim,
+    # se o treino for interrompido antes de --fid_start_epoch, esse custo
+    # nunca é pago.
+    # =====================================================
+
+    def _ensure_fid_real_stats():
+        nonlocal fid_mu_real, fid_sigma_real, fid_extractor
+
+        if fid_mu_real is not None:
+            return
+
+        n_real = len(val_loader.dataset)
+
+        if fid_extractor is None:
+            fid_extractor = InceptionFeatureExtractor(device=device)
+
+        # Cache em disco: sem isso, todo --resume_ckpt repetiria esse
+        # custo do zero.
+        fid_cache_path = os.path.join(save_dir, "fid_real_stats.npz")
+
+        if os.path.isfile(fid_cache_path):
+
+            cached = np.load(fid_cache_path)
+
+            if int(cached["n_real"]) == n_real:
+                fid_mu_real    = cached["mu"]
+                fid_sigma_real = cached["sigma"]
+                print(f"[FID] Estatísticas reais carregadas do cache "
+                      f"({fid_cache_path}, {n_real} imagens).")
+                return
+            else:
+                print(f"[FID] Cache em {fid_cache_path} tem n_real="
+                      f"{int(cached['n_real'])}, mas o split atual tem "
+                      f"{n_real} — recalculando.")
+
+        def _load_real_chunk(start, end):
+            imgs = []
+            for _i in range(start, end):
+                real_idx = val_loader.dataset.indices[_i]
+                fname    = val_base.samples[real_idx][0]
+                img      = PILImage.open(
+                    os.path.join(val_base.image_dir, fname)
+                ).convert("RGB")
+                imgs.append(val_base.transform(img))
+            return torch.stack(imgs)
+
+        print(f"[FID] Extraindo features InceptionV3 de {n_real} imagens reais "
+              f"(todo o conjunto de validação, uma vez)...")
+        real_acts = compute_real_activations_streamed(
+            _load_real_chunk, n_real, fid_extractor, chunk_size=args.fid_real_batch_size
+        )
+        fid_mu_real, fid_sigma_real = calculate_activation_statistics(real_acts)
+
+        np.savez(
+            fid_cache_path,
+            mu=fid_mu_real,
+            sigma=fid_sigma_real,
+            n_real=n_real,
+        )
+        print(f"[FID] Estatísticas reais salvas em {fid_cache_path}.")
 
     # =====================================================
     # TRAIN LOOP
@@ -727,6 +876,7 @@ def train(args):
                     "best_val_loss":                      best_val_loss,
                     "num_img_tokens":                     num_img_tokens,
                     "encoder":                            args.encoder,
+                    "fid":                                last_fid_value,
                 }
 
                 if save_periodic:
@@ -767,7 +917,7 @@ def train(args):
 
                 # ---- atributos originais ----
                 print("Sampling (composable CFG — atributos originais)...")
-                latents_orig = _sample_composable_cfg(
+                latents_orig = _sample_composable_ddim(
                     unet=ema_model,
                     diffusion=diffusion,
                     id_tokens_full=id_tok,
@@ -777,6 +927,7 @@ def train(args):
                     device=device,
                     s_id=args.s_id_val,
                     s_attr=args.s_attr_val,
+                    ddim_steps=args.ddim_steps,
                 )
                 images_orig = vae.decode(latents_orig / 0.18215)
 
@@ -795,7 +946,7 @@ def train(args):
                 attr_tok_smile = ema_attribute_embedder(attrs_smile)
 
                 print("Sampling (composable CFG — Smiling=1 forçado)...")
-                latents_smile = _sample_composable_cfg(
+                latents_smile = _sample_composable_ddim(
                     unet=ema_model,
                     diffusion=diffusion,
                     id_tokens_full=id_tok,
@@ -805,6 +956,7 @@ def train(args):
                     device=device,
                     s_id=args.s_id_val,
                     s_attr=args.s_attr_val,
+                    ddim_steps=args.ddim_steps,
                 )
                 images_smile = vae.decode(latents_smile / 0.18215)
 
@@ -814,6 +966,84 @@ def train(args):
                     make_grid(images_smile, nrow=4, normalize=True, value_range=(-1, 1)),
                     epoch,
                 )
+
+        # =================================================
+        # FID  —  custoso, só a cada --fid_every épocas e só depois de
+        # --fid_start_epoch (nos primeiros epochs o modelo ainda gera
+        # ruído/rostos incoerentes — FID não é informativo, só custa
+        # tempo de treino que dá pra usar em steps de verdade).
+        # =================================================
+        #
+        # As estatísticas REAIS são calculadas (ou carregadas do cache)
+        # na primeira vez que este bloco roda de fato — ver
+        # _ensure_fid_real_stats(). Aqui só recalculamos as estatísticas
+        # do conjunto GERADO (o encoder/UNet EMA muda a cada época).
+        # =================================================
+
+        epochs_since_fid_start = epoch - args.fid_start_epoch
+
+        if (
+            is_master
+            and args.fid_every > 0
+            and epochs_since_fid_start >= 0
+            and (epochs_since_fid_start % args.fid_every == 0 or epoch == args.epochs - 1)
+        ):
+
+            _ensure_fid_real_stats()
+
+            ema_model.eval()
+            ema_image_encoder.eval()
+            ema_attribute_embedder.eval()
+
+            with torch.no_grad():
+
+                print(f"[FID] Gerando {fid_ref_imgs.shape[0]} amostras para avaliação...")
+
+                if args.encoder == "arcface_only":
+                    id_tok_fid = ema_image_encoder(
+                        ref_img=fid_ref_imgs,
+                        id_emb=fid_id_emb,
+                    )
+                else:
+                    id_tok_fid = ema_image_encoder(
+                        ref_img=fid_ref_imgs,
+                        id_emb=fid_id_emb,
+                        clip_tokens_raw=fid_clip,
+                    )
+
+                attr_tok_fid = ema_attribute_embedder(fid_attrs)
+
+                def _gen_fid_chunk(id_chunk, attr_chunk):
+                    lat = _sample_composable_ddim(
+                        unet=ema_model,
+                        diffusion=diffusion,
+                        id_tokens_full=id_chunk,
+                        attr_tokens_full=attr_chunk,
+                        n=id_chunk.shape[0],
+                        channels=latent_dim,
+                        device=device,
+                        s_id=args.s_id_val,
+                        s_attr=args.s_attr_val,
+                        ddim_steps=args.ddim_steps,
+                    )
+                    return vae.decode(lat / 0.18215)
+
+                fake_acts = compute_fake_activations_batched(
+                    generate_fn=_gen_fid_chunk,
+                    id_tokens_full=id_tok_fid,
+                    attr_tokens_full=attr_tok_fid,
+                    extractor=fid_extractor,
+                    chunk_size=args.fid_batch_size,
+                )
+
+                fid_mu_fake, fid_sigma_fake = calculate_activation_statistics(fake_acts)
+                fid_value = calculate_frechet_distance(
+                    fid_mu_real, fid_sigma_real, fid_mu_fake, fid_sigma_fake
+                )
+                last_fid_value = fid_value
+
+                print(f"[FID] Epoch {epoch}: FID = {fid_value:.3f}")
+                board.log_scalar("Metrics/FID", fid_value, epoch)
 
     if is_master:
         board.close()
@@ -866,6 +1096,59 @@ if __name__ == "__main__":
     # ---- escalas usadas só nos samples de validação ----
     parser.add_argument("--s_id_val",   type=float, default=3.0)
     parser.add_argument("--s_attr_val", type=float, default=5.0)
+
+    parser.add_argument(
+        "--ddim_steps", type=int, default=50,
+        help="Nº de passos do amostrador DDIM usado nas avaliações "
+             "periódicas (samples de visualização e FID) — NÃO afeta o "
+             "treino (que continua treinando em t contínuo via MSE de "
+             "denoising). Substitui a amostragem ancestral de ~999 passos, "
+             "cortando o custo de cada avaliação em ~noise_steps/ddim_steps "
+             "vezes. 50 é o padrão comum na literatura (Song et al. 2020); "
+             "suba se notar degradação visual perceptível nas amostras.",
+    )
+
+    # ---- FID (custoso — só roda a cada N épocas) ----
+    parser.add_argument(
+        "--fid_every", type=int, default=10,
+        help="Calcula FID a cada N épocas a partir de --fid_start_epoch "
+             "(0 desativa). As estatísticas REAIS usam o conjunto de "
+             "validação inteiro e são calculadas (ou carregadas do cache "
+             "em disco) na primeira vez que forem necessárias; a cada "
+             "avaliação só as estatísticas do conjunto GERADO pelo EMA "
+             "mudam.",
+    )
+    parser.add_argument(
+        "--fid_start_epoch", type=int, default=0,
+        help="Só começa a calcular FID a partir deste epoch. Nos primeiros "
+             "epochs o modelo ainda gera ruído/rostos incoerentes e o FID "
+             "não é informativo — pular esse trecho economiza tempo de "
+             "amostragem (por difusão completa) que pode ir para steps de "
+             "treino de verdade. Ajuste proporcional ao seu --epochs total, "
+             "não a um valor absoluto.",
+    )
+    parser.add_argument(
+        "--fid_num_samples", type=int, default=256,
+        help="Nº de imagens GERADAS (via difusão completa) para estimar as "
+             "estatísticas do lado 'fake' do FID a cada avaliação — não "
+             "afeta o lado real, que sempre usa o split de validação "
+             "inteiro. O ideal estatístico é >=2048 (dimensão das features "
+             "da InceptionV3), mas cada unidade aqui é uma amostragem por "
+             "difusão completa repetida a cada --fid_every épocas; 256 é um "
+             "compromisso custo/estabilidade, não o ideal — suba se puder "
+             "pagar o tempo de geração extra.",
+    )
+    parser.add_argument(
+        "--fid_batch_size", type=int, default=16,
+        help="Tamanho do chunk de amostragem/inferência para o lado GERADO "
+             "do FID (controla o pico de uso de memória da difusão).",
+    )
+    parser.add_argument(
+        "--fid_real_batch_size", type=int, default=128,
+        help="Tamanho do chunk de leitura+InceptionV3 para o lado REAL do "
+             "FID (só carrega imagem + forward, sem amostragem por difusão "
+             "— pode ser bem maior que --fid_batch_size).",
+    )
 
     parser.add_argument("--resume_ckpt",    type=str, default=None)
     parser.add_argument("--warmstart_ckpt", type=str, default=None)
