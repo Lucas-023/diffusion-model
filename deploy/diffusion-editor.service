@@ -1,0 +1,24 @@
+# Unidade systemd para o editor (rota sem Docker).
+#
+# 1. Ajuste os caminhos/usuário abaixo.
+# 2. sudo cp deploy/diffusion-editor.service /etc/systemd/system/
+# 3. sudo systemctl daemon-reload && sudo systemctl enable --now diffusion-editor
+# Logs: journalctl -u diffusion-editor -f
+
+[Unit]
+Description=Editor de atributos faciais (LDM composable CFG)
+After=network.target
+
+[Service]
+User=lucas
+WorkingDirectory=/home/lucas/diffusion-model
+Environment=DFM_CKPT=/home/lucas/weights/ckpt_best.pt
+Environment=DFM_VAE_CKPT=/home/lucas/weights/vae_epoch_62.pt
+Environment=DFM_CLASSIFIER_CKPT=/home/lucas/weights/attr_classifier.pt
+# Environment=DFM_API_TOKEN=troque-por-um-token
+ExecStart=/home/lucas/diffusion-model/.venv/bin/uvicorn app.backend.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

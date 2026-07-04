@@ -1,0 +1,43 @@
+# Deploy do editor com GPU.
+#
+# Uso (deste diretório):
+#   WEIGHTS_DIR=/caminho/dos/pesos docker compose up -d --build
+#
+# WEIGHTS_DIR deve conter (nomes ajustáveis nas variáveis abaixo):
+#   ckpt_best.pt          — checkpoint de train_cfg_composable*.py
+#   vae_epoch_62.pt       — checkpoint do VAE
+#   attr_classifier.pt    — (opcional) CLIPAttributeClassifier
+
+services:
+  editor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: diffusion-editor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DFM_CKPT: /weights/${CKPT_NAME:-ckpt_best.pt}
+      DFM_VAE_CKPT: /weights/${VAE_NAME:-vae_epoch_62.pt}
+      DFM_CLASSIFIER_CKPT: /weights/${CLASSIFIER_NAME:-attr_classifier.pt}
+      DFM_API_TOKEN: ${DFM_API_TOKEN:-}
+    volumes:
+      - ${WEIGHTS_DIR:?defina WEIGHTS_DIR com o diretório dos pesos}:/weights:ro
+      - results:/data/results
+      # caches de modelos baixados em runtime (CLIP do HuggingFace e
+      # detector buffalo_l do insightface) — sobrevivem a recreates
+      - hf-cache:/root/.cache/huggingface
+      - insightface-cache:/root/.insightface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  results:
+  hf-cache:
+  insightface-cache:

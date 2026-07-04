@@ -12,6 +12,10 @@
 !app/frontend/*
 !app/requirements-app.txt
 
+# Permite docs e arquivos de deploy da VM
+!DEPLOY.md
+!deploy/*
+
 # Bloqueia explicitamente o que não deve subir nunca
 __pycache__/
 .venv/
