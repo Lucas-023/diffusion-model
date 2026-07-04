@@ -1,5 +1,31 @@
 """
-Fine-tuning do classificador de atributos CelebA (CLIPAttributeClassifier).
+Fine-tuning do classificador de atributos CelebA (CLIPAttributeClassifier)
+— VARIANTE com alinhamento NATIVO do CelebA (CelebAAligner), em vez do
+template ArcFace usado em train_attribute_classifier.py.
+
+Por quê esta variante existe: várias das 40 classes do CelebA são atributos
+de cabelo/chapéu/orelha/acessório (Bald, Bangs, Wearing_Hat,
+Wearing_Earrings, Receding_Hairline, ...). O template ArcFace é otimizado
+para reconhecimento de identidade (recorte apertado olhos-nariz-boca) e
+pode cortar exatamente a região de cabeça/cabelo que esses atributos
+precisam. O recorte nativo do CelebA (data/correct_alignment.py) mantém
+mais dessa região E usa a MESMA convenção do resto do pipeline de difusão
+(VAE, ArcFaceEncoder, ImageConditionEncoder) — ver pipeline.md seção 3.
+
+Este script é um experimento para comparar contra o checkpoint treinado
+com FaceAligner (train_attribute_classifier.py, val F1≈0.73) — usa
+diretórios de cache e checkpoint DIFERENTES para não sobrescrever aquele
+resultado.
+
+Também inclui 3 melhorias na receita de treino (replicadas de volta em
+train_attribute_classifier.py para manter a comparação de alinhamento
+controlada — só o alinhamento difere entre os dois scripts):
+  - Asymmetric Loss no lugar de BCEWithLogitsLoss(pos_weight=...).
+  - Warmup linear + cosine decay de LR (o run anterior, com LR fixo,
+    teve seu melhor epoch na época 2 e degradou depois).
+  - Clipping de gradiente + EMA dos pesos (validação/checkpoint usam o
+    modelo EMA, não o modelo cru) — mesmo padrão já usado em
+    train/train_image_cond.py e train/train_dist.py.
 
 Não faz parte do pipeline de treino da diffusion — é um script
 independente para treinar o AttributePredictor "de verdade" (o
@@ -7,9 +33,11 @@ existente em models/encoders.py nunca foi treinado, é um placeholder
 com pesos ImageNet aleatórios no fc).
 
 O que este script faz, na ordem:
-  1. Alinha cada foto do CelebA com o mesmo FaceAligner usado na
-     inferência (data/face_align.py) e cacheia o resultado em disco —
-     alinhar por época seria caro (detecção de rosto via ONNX por
+  1. Alinha cada foto do CelebA com CelebAAligner (data/correct_alignment.py)
+     para o template NATIVO do CelebA, aplica CenterCrop(178) (mesmo recorte
+     usado em todo o resto do pipeline, ver _IDENTITY_TRANSFORM em
+     utils/utils_celeba.py e cache_generator.py) e cacheia o resultado em
+     disco — alinhar por época seria caro (detecção de rosto via ONNX por
      imagem); alinhar uma vez e reusar o cache resolve isso.
   2. Split por IDENTIDADE (não por imagem) para não vazar a mesma
      pessoa entre train/val/test.
@@ -17,24 +45,18 @@ O que este script faz, na ordem:
      downsample/upsample, color jitter) — CelebA é mais "limpo" que
      fotos reais, isso ajuda a fechar esse gap.
   4. Asymmetric Loss por atributo (CelebA é muito desbalanceado — sem
-     isso o modelo ignora atributos raros; substitui
-     BCEWithLogitsLoss(pos_weight=...) — ver AsymmetricLoss abaixo).
+     isso o modelo ignora atributos raros).
   5. Fine-tuning parcial do CLIP ViT-L/14 (só os últimos
      --unfreeze_last_n blocos + head treinam), com warmup+cosine LR,
-     clipping de gradiente e EMA dos pesos (mesmo padrão usado em
-     train/train_image_cond.py e train/train_dist.py).
+     clipping de gradiente e EMA dos pesos.
   6. Calibração de limiar por atributo (F1-ótimo) na validação (usando
      o modelo EMA), salva junto do checkpoint.
 
 Uso:
-    python -m train.train_attribute_classifier \\
+    python -m train.train_attribute_classifier_celeba_align \\
         --data_root ./CelebA_data/celeba \\
-        --output ./checkpoints/attribute_classifier_v2.pt \\
+        --output ./checkpoints/attribute_classifier_celeba_align.pt \\
         --epochs 10 --batch_size 64
-
-Nota: o default de --output mudou para attribute_classifier_v2.pt (era
-attribute_classifier.pt) para não sobrescrever o checkpoint já treinado
-com a receita antiga (BCE+pos_weight, sem scheduler/EMA, val F1≈0.73).
 
 Requer: CelebA_data/celeba/{img_align_celeba/img_align_celeba,
 list_attr_celeba.txt|csv} e, opcionalmente, identity_CelebA.txt para o
@@ -57,7 +79,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
-from data.face_align import FaceAligner
+from data.correct_alignment import CelebAAligner
 from models.attribute_classifier import CLIPAttributeClassifier
 
 
@@ -195,11 +217,16 @@ def _split_by_identity(filenames, identity_txt, seed=42, train_frac=0.70, val_fr
 # PRÉ-CACHE DE ALINHAMENTO
 # ============================================================
 
-def build_align_cache(filenames, image_dir, cache_dir, image_size=224):
-    """Alinha cada imagem uma única vez e salva em cache_dir. Idempotente
-    (pula arquivos já processados) — pode ser interrompido e retomado."""
+def build_align_cache(filenames, image_dir, cache_dir):
+    """Alinha cada imagem uma única vez (template nativo do CelebA, ver
+    data/correct_alignment.py) e salva em cache_dir já com CenterCrop(178)
+    aplicado (mesmo recorte usado em todo o resto do pipeline — ver
+    _IDENTITY_TRANSFORM em utils/utils_celeba.py e cache_generator.py).
+    Idempotente (pula arquivos já processados) — pode ser interrompido e
+    retomado."""
     os.makedirs(cache_dir, exist_ok=True)
-    aligner = FaceAligner(image_size=image_size)
+    aligner = CelebAAligner()
+    square_crop = T.CenterCrop(178)
 
     n_missing_face = 0
     todo = [f for f in filenames if not os.path.exists(os.path.join(cache_dir, f))]
@@ -208,7 +235,8 @@ def build_align_cache(filenames, image_dir, cache_dir, image_size=224):
     for i, fname in enumerate(todo):
         src = os.path.join(image_dir, fname)
         img = Image.open(src).convert("RGB")
-        aligned, found = aligner.align_pil(img)
+        aligned, found = aligner.align_pil(img)   # 178x218, convenção nativa do CelebA
+        aligned = square_crop(aligned)            # 178x178, igual ao resto do pipeline
         if not found:
             n_missing_face += 1
         aligned.save(os.path.join(cache_dir, fname), quality=95)
@@ -344,7 +372,7 @@ def train(args):
     )
 
     if not args.skip_align_cache:
-        build_align_cache(filenames, image_dir, args.align_cache_dir, image_size=224)
+        build_align_cache(filenames, image_dir, args.align_cache_dir)
     aligned_dir = args.align_cache_dir
 
     train_ds = AlignedCelebAAttrDataset(samples, attr_names, aligned_dir, train_idx, train=True)
@@ -456,10 +484,10 @@ def build_argparser():
     p.add_argument("--data_root", type=str, default="./CelebA_data/celeba")
     p.add_argument("--image_dir", type=str, default=None)
     p.add_argument("--identity_txt", type=str, default=None)
-    p.add_argument("--align_cache_dir", type=str, default="./cache_aligned_celeba")
+    p.add_argument("--align_cache_dir", type=str, default="./cache_aligned_celeba_native")
     p.add_argument("--skip_align_cache", action="store_true",
                     help="Pula a etapa de alinhamento (assume que --align_cache_dir já está populado).")
-    p.add_argument("--output", type=str, default="./checkpoints/attribute_classifier_v2.pt")
+    p.add_argument("--output", type=str, default="./checkpoints/attribute_classifier_celeba_align.pt")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=8)

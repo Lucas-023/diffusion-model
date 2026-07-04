@@ -79,7 +79,7 @@ def setup_ddp():
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="gloo" if os.name == "nt" else "nccl")
 
     local_rank  = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
@@ -174,7 +174,7 @@ def train(args):
     # id_data = [B, 3, 256, 256] em [-1, 1]
     # =====================================================
 
-    train_loader, val_loader, _, train_sampler = get_data_imagecond(
+    train_loader, val_loader, _, train_sampler, _ = get_data_imagecond(
         args,
         is_distributed=True,
     )
