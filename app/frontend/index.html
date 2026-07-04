@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Editor de Atributos Faciais — LDM</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Editor de Atributos Faciais</h1>
+    <p class="subtitle">Latent Diffusion + Composable CFG (identidade ArcFace + 40 atributos CelebA)</p>
+  </div>
+  <div id="health" class="pill pill-wait">conectando…</div>
+</header>
+
+<main>
+
+  <!-- ============ COLUNA ESQUERDA: foto + atributos ============ -->
+  <section class="col">
+
+    <div class="card">
+      <h2><span class="step">1</span> Foto</h2>
+      <div id="drop" class="drop">
+        <input type="file" id="file" accept="image/*" hidden>
+        <p id="drop-hint">Arraste uma foto aqui ou <b>clique para escolher</b></p>
+        <img id="preview" hidden alt="pré-visualização">
+      </div>
+      <div class="row">
+        <button id="btn-classify" class="btn" disabled>Classificar instantaneamente</button>
+        <span id="classify-info" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">2</span> Atributos desejados</h2>
+      <p class="muted">Clique para ligar/desligar. Borda âmbar = diferente da foto original
+        (é o que será editado).</p>
+      <div id="attrs" class="attr-grid"></div>
+      <div class="row">
+        <button id="btn-reset" class="btn btn-ghost" disabled>Voltar aos detectados</button>
+        <button id="btn-clear" class="btn btn-ghost">Limpar todos</button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ============ COLUNA DIREITA: parâmetros + resultado ============ -->
+  <section class="col">
+
+    <div class="card">
+      <h2><span class="step">3</span> Método e parâmetros</h2>
+
+      <div class="method-row">
+        <label class="method"><input type="radio" name="method" value="sdedit" checked>
+          <div><b>SDEdit</b><span>ruidifica a foto até um ponto intermediário e
+            reamostra — knob principal: strength</span></div>
+        </label>
+        <label class="method"><input type="radio" name="method" value="inversion">
+          <div><b>Inversão DDIM</b><span>recupera o z_T exato da foto e reamostra
+            com os atributos editados — preserva mais estrutura</span></div>
+        </label>
+      </div>
+
+      <div id="strengths-box" class="field">
+        <label>Strengths (cada um vira uma coluna no resultado)</label>
+        <div id="strengths" class="chip-row"></div>
+      </div>
+
+      <div class="sliders">
+        <div class="field">
+          <label>s_id — força da identidade <output id="s_id_out"></output></label>
+          <input type="range" id="s_id" min="0" max="8" step="0.5">
+        </div>
+        <div class="field">
+          <label>s_attr — força dos atributos <output id="s_attr_out"></output></label>
+          <input type="range" id="s_attr" min="0" max="10" step="0.5">
+        </div>
+        <div class="field" id="s_clip_box">
+          <label>s_clip — ramo CLIP (vs. ArcFace) <output id="s_clip_out"></output></label>
+          <input type="range" id="s_clip" min="0" max="8" step="0.5">
+        </div>
+      </div>
+
+      <div class="row small-fields">
+        <div class="field"><label>Passos DDIM</label>
+          <input type="number" id="ddim_steps" value="50" min="1" max="500"></div>
+        <div class="field"><label>Seed</label>
+          <input type="number" id="seed" value="0"></div>
+      </div>
+
+      <button id="btn-run" class="btn btn-primary" disabled>Gerar</button>
+    </div>
+
+    <div class="card" id="review-card" hidden>
+      <h2><span class="step">4</span> Confirmar atributos</h2>
+      <p class="muted">Âmbar = atributo ligado no alvo. Cinza = desligado.
+        Confira antes de gerar — a edição pode levar algum tempo.</p>
+      <div id="review-grid" class="attr-grid"></div>
+      <div class="row">
+        <button id="btn-back" class="btn btn-ghost">Voltar e editar</button>
+        <button id="btn-confirm" class="btn btn-primary">Confirmar e gerar</button>
+      </div>
+    </div>
+
+    <div class="card" id="result-card" hidden>
+      <h2><span class="step">5</span> Resultado</h2>
+      <div id="progress-box" hidden>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <p id="progress-text" class="muted"></p>
+      </div>
+      <p id="edit-summary" class="muted"></p>
+      <div id="results" class="results"></div>
+      <p id="error" class="error" hidden></p>
+    </div>
+
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

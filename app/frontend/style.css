@@ -1,0 +1,184 @@
+/* Editor de Atributos Faciais — tema escuro simples, sem dependências */
+
+:root {
+  --bg: #0f1115;
+  --card: #171a21;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #8b93a3;
+  --accent: #4f8cff;
+  --warn: #f0b429;
+  --err: #ef5350;
+  --ok: #4caf7d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 28px;
+  border-bottom: 1px solid var(--border);
+}
+h1 { margin: 0; font-size: 20px; }
+.subtitle { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+
+.pill {
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+}
+.pill-ok   { color: var(--ok);   border-color: var(--ok); }
+.pill-wait { color: var(--warn); border-color: var(--warn); }
+.pill-err  { color: var(--err);  border-color: var(--err); }
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  padding: 20px 28px 60px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+@media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+.col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+.card h2 { margin: 0 0 12px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+.step {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent); color: #fff; font-size: 13px;
+}
+
+.muted { color: var(--muted); font-size: 13px; }
+.error { color: var(--err); font-size: 14px; white-space: pre-wrap; }
+
+.row { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+
+/* ---- upload ---- */
+.drop {
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  min-height: 160px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  text-align: center;
+  padding: 12px;
+  transition: border-color .15s;
+}
+.drop:hover, .drop.dragover { border-color: var(--accent); }
+.drop img { max-width: 100%; max-height: 320px; border-radius: 8px; }
+
+/* ---- atributos ---- */
+.attr-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.attr {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  transition: all .1s;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attr.on { background: rgba(79,140,255,.18); border-color: var(--accent); color: var(--text); }
+.attr.changed { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn) inset; }
+
+/* ---- revisão (âmbar = ligado no alvo, cinza = desligado) ---- */
+.review-attr { cursor: default; text-align: center; }
+.review-attr.amber { background: rgba(240,180,41,.18); border-color: var(--warn); color: var(--text); }
+.review-attr.grey  { background: transparent; border-color: var(--border); color: var(--muted); }
+
+/* ---- botões ---- */
+.btn {
+  background: #232836;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; width: 100%; margin-top: 14px; padding: 11px; font-weight: 600; }
+.btn-ghost { background: transparent; }
+
+/* ---- método ---- */
+.method-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 560px) { .method-row { grid-template-columns: 1fr; } }
+.method {
+  display: flex; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; cursor: pointer; font-size: 13px;
+}
+.method:has(input:checked) { border-color: var(--accent); background: rgba(79,140,255,.08); }
+.method input { margin-top: 3px; }
+.method span { display: block; color: var(--muted); font-size: 12px; }
+
+/* ---- campos ---- */
+.field { margin-top: 14px; }
+.field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.field output { color: var(--text); font-weight: 600; margin-left: 6px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+input[type=number] {
+  background: #0f1115; color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px 10px; width: 110px; font-size: 14px;
+}
+.small-fields { gap: 24px; }
+.sliders { margin-top: 4px; }
+
+.chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  border: 1px solid var(--border); border-radius: 999px;
+  background: transparent; color: var(--muted);
+  padding: 4px 12px; font-size: 13px; cursor: pointer;
+}
+.chip.on { background: rgba(79,140,255,.18); border-color: var(--accent); color: var(--text); }
+
+/* ---- progresso / resultados ---- */
+.progress {
+  height: 8px; border-radius: 4px; background: #232836;
+  overflow: hidden; margin: 8px 0 6px;
+}
+#progress-bar {
+  height: 100%; width: 0%;
+  background: var(--accent);
+  transition: width .4s ease;
+}
+.results {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px; margin-top: 12px;
+}
+.results figure { margin: 0; }
+.results img { width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+.results figcaption { font-size: 12.5px; color: var(--muted); text-align: center; margin-top: 4px; }

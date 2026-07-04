@@ -8,6 +8,10 @@
 !*.py
 !*.ipynb
 
+# Permite frontend do webapp e suas dependências
+!app/frontend/*
+!app/requirements-app.txt
+
 # Bloqueia explicitamente o que não deve subir nunca
 __pycache__/
 .venv/

@@ -1,0 +1,4 @@
+# Dependências extras do servidor web (além do requirements.txt da raiz).
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+python-multipart>=0.0.9
