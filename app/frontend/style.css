@@ -112,7 +112,7 @@ main {
 .attr.changed { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn) inset; }
 
 /* ---- revisão (âmbar = ligado no alvo, cinza = desligado) ---- */
-.review-attr { cursor: default; text-align: center; }
+.review-attr { text-align: center; }
 .review-attr.amber { background: rgba(240,180,41,.18); border-color: var(--warn); color: var(--text); }
 .review-attr.grey  { background: transparent; border-color: var(--border); color: var(--muted); }
 

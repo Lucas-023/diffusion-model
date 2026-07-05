@@ -205,16 +205,32 @@ function updateRunButton() {
 // revisão (âmbar/cinza) antes de gerar
 // ------------------------------------------------------------
 
+function renderReview() {
+  for (const chip of $("review-grid").children) {
+    const on = state.targetAttrs.has(chip.dataset.name);
+    chip.classList.toggle("amber", on);
+    chip.classList.toggle("grey", !on);
+  }
+}
+
 function openReview() {
   const grid = $("review-grid");
   grid.innerHTML = "";
   for (const name of state.attrNames) {
-    const chip = document.createElement("div");
-    chip.className = "attr review-attr " + (state.targetAttrs.has(name) ? "amber" : "grey");
+    const chip = document.createElement("button");
+    chip.className = "attr review-attr";
     chip.textContent = name.replaceAll("_", " ");
     chip.title = name;
+    chip.dataset.name = name;
+    chip.onclick = () => {
+      if (state.targetAttrs.has(name)) state.targetAttrs.delete(name);
+      else state.targetAttrs.add(name);
+      renderReview();
+      renderAttrs(); // mantém a grade de atributos (passo 2) em sincronia
+    };
     grid.appendChild(chip);
   }
+  renderReview();
   $("review-card").hidden = false;
   $("result-card").hidden = true;
   $("review-card").scrollIntoView({ behavior: "smooth", block: "start" });
