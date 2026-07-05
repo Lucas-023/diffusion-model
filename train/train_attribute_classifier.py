@@ -57,6 +57,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
+from board import Board
 from data.face_align import FaceAligner
 from models.attribute_classifier import CLIPAttributeClassifier
 
@@ -324,12 +325,31 @@ def calibrate_thresholds(probs, targets, n_steps=37):
     return thresholds
 
 
+@torch.no_grad()
+def compute_metrics(probs, targets, thresholds):
+    """probs, targets, thresholds: [N, num_attrs] / [num_attrs] em CPU.
+    Aplica os MESMOS thresholds calibrados (por atributo) usados no F1, para
+    que treino e validação sejam comparáveis com o mesmo critério de decisão.
+    Retorna (mean_acc, mean_f1, f1_per_attr)."""
+    preds = (probs > thresholds.unsqueeze(0)).float()
+    tp = (preds * targets).sum(0)
+    fp = (preds * (1 - targets)).sum(0)
+    fn = ((1 - preds) * targets).sum(0)
+    tn = ((1 - preds) * (1 - targets)).sum(0)
+
+    f1_per_attr = 2 * tp / (2 * tp + fp + fn + 1e-8)
+    acc_per_attr = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+
+    return acc_per_attr.mean().item(), f1_per_attr.mean().item(), f1_per_attr
+
+
 # ============================================================
 # TREINO
 # ============================================================
 
 def train(args):
     device = args.device
+    board = Board(run_name=args.run_name, enabled=True)
 
     attr_path = _find_attr_path(args.data_root)
     samples, attr_names = _read_attr_file(attr_path)
@@ -388,11 +408,13 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     best_f1 = -1.0
+    global_step = 0
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     for epoch in range(args.epochs):
         model.train()
         running_loss = 0.0
+        train_probs_list, train_targets_list = [], []
 
         for img, attrs in train_loader:
             img, attrs = img.to(device, non_blocking=True), attrs.to(device, non_blocking=True)
@@ -410,32 +432,60 @@ def train(args):
             update_ema(ema_model, model, decay=args.ema_decay)
 
             running_loss += loss.item() * img.size(0)
+            board.log_scalar("Loss/Batch", loss.item(), global_step)
+            global_step += 1
+
+            # acumula previsões do próprio batch de treino (mesmo espírito de
+            # running_loss) para computar acc/F1 de treino mais abaixo — sem
+            # rodar uma segunda passada extra sobre o dataset de treino.
+            train_probs_list.append(torch.sigmoid(logits.detach()).float().cpu())
+            train_targets_list.append(attrs.cpu())
 
         scheduler.step()
         train_loss = running_loss / len(train_ds)
 
         # -------- validação (pesos EMA — mais estável que o modelo cru) --------
         all_probs, all_targets = [], []
+        running_val_loss = 0.0
         with torch.no_grad():
             for img, attrs in val_loader:
                 img = img.to(device, non_blocking=True)
+                attrs_dev = attrs.to(device, non_blocking=True)
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     logits = ema_model(img)
+                    val_loss_batch = criterion(logits, attrs_dev)
+                running_val_loss += val_loss_batch.item() * img.size(0)
                 all_probs.append(torch.sigmoid(logits).float().cpu())
                 all_targets.append(attrs)
 
+        val_loss = running_val_loss / len(val_ds)
         probs = torch.cat(all_probs)
         targets = torch.cat(all_targets)
 
+        # thresholds calibrados na validação — usados também no treino
+        # abaixo, para que acc/F1 de treino e validação sejam comparáveis
+        # com o mesmo critério de decisão por atributo.
         thresholds = calibrate_thresholds(probs, targets)
-        preds = (probs > thresholds.unsqueeze(0)).float()
-        tp = (preds * targets).sum(0)
-        fp = (preds * (1 - targets)).sum(0)
-        fn = ((1 - preds) * targets).sum(0)
-        f1_per_attr = 2 * tp / (2 * tp + fp + fn + 1e-8)
-        mean_f1 = f1_per_attr.mean().item()
+        mean_acc, mean_f1, f1_per_attr = compute_metrics(probs, targets, thresholds)
 
-        print(f"[epoch {epoch+1}/{args.epochs}] train_loss={train_loss:.4f} val_mean_f1={mean_f1:.4f}")
+        train_probs = torch.cat(train_probs_list)
+        train_targets = torch.cat(train_targets_list)
+        mean_train_acc, mean_train_f1, _ = compute_metrics(train_probs, train_targets, thresholds)
+
+        print(
+            f"[epoch {epoch+1}/{args.epochs}] "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"train_acc={mean_train_acc:.4f} val_acc={mean_acc:.4f} "
+            f"train_f1={mean_train_f1:.4f} val_f1={mean_f1:.4f}"
+        )
+
+        board.log_scalars("Loss/Epoch", {"train": train_loss, "val": val_loss}, epoch)
+        board.log_scalars("Accuracy/Epoch", {"train": mean_train_acc, "val": mean_acc}, epoch)
+        board.log_scalars("F1/Epoch", {"train": mean_train_f1, "val": mean_f1}, epoch)
+        board.log_scalar("Metrics/LR_Head", optimizer.param_groups[0]["lr"], epoch)
+        board.log_scalar("Metrics/LR_Backbone", optimizer.param_groups[1]["lr"], epoch)
+        for name, f1_val in zip(attr_names, f1_per_attr.tolist()):
+            board.log_scalar(f"F1_per_attr/{name}", f1_val, epoch)
 
         if mean_f1 > best_f1:
             best_f1 = mean_f1
@@ -448,11 +498,14 @@ def train(args):
             }, args.output)
             print(f"[checkpoint] salvo em {args.output} (val_mean_f1={mean_f1:.4f})")
 
+    board.close()
     print(f"Treino concluído. Melhor val_mean_f1={best_f1:.4f}")
 
 
 def build_argparser():
     p = argparse.ArgumentParser()
+    p.add_argument("--run_name", type=str, default="attribute_classifier",
+                    help="Nome da run — logs em runs/<run_name>/<timestamp>/ (TensorBoard).")
     p.add_argument("--data_root", type=str, default="./CelebA_data/celeba")
     p.add_argument("--image_dir", type=str, default=None)
     p.add_argument("--identity_txt", type=str, default=None)
