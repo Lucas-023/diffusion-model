@@ -358,6 +358,15 @@ function wire() {
     state.targetAttrs.clear();
     renderAttrs();
   };
+  $("btn-mark-orig").onclick = () => {
+    state.origAttrs = new Set(state.targetAttrs);
+    state.classified = true;
+    $("btn-reset").disabled = false;
+    $("mark-orig-info").textContent =
+      `Seleção atual (${state.origAttrs.size} atributos) marcada como a foto original — ` +
+      "continue ligando/desligando para definir o alvo da edição.";
+    renderAttrs();
+  };
 
   for (const radio of document.querySelectorAll("input[name=method]")) {
     radio.onchange = () => { applyMethodDefaults(); updateRunButton(); };
