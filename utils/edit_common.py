@@ -46,17 +46,26 @@ from vae.modules import VAE
 # COMPATIBILIDADE DE CHECKPOINT
 # ============================================================
 
-def _fix_clip_state_dict(state):
-    """Checkpoints antigos foram salvos com uma versão do `transformers`
-    cujo CLIPVisionModel não tinha o submódulo `vision_model` (chaves
-    "clip.embeddings...", "clip.encoder...", "clip.post_layernorm...").
-    A versão atual sempre envolve a transformer em `self.vision_model`
-    ("clip.vision_model.embeddings...", etc). Remapeia as chaves antigas
-    para o layout atual, sem precisar fixar uma versão antiga do pacote."""
+def _fix_clip_state_dict(state, target_state=None):
+    """Versões do `transformers` divergem no layout do CLIPVisionModel:
+    algumas envolvem a transformer em `self.vision_model`
+    ("clip.vision_model.embeddings...") e outras não ("clip.embeddings...").
+    Um checkpoint salvo num layout não carrega num ambiente com o outro.
+
+    Remapeia as chaves "clip.*" do checkpoint para o layout que o MODELO
+    instanciado espera, em qualquer direção. `target_state` é o
+    state_dict() do modelo de destino; sem ele, assume o layout com
+    `vision_model` (comportamento antigo desta função)."""
+    target_has_vm = True if target_state is None else any(
+        k.startswith("clip.vision_model.") for k in target_state
+    )
     fixed = {}
     for k, v in state.items():
-        if k.startswith("clip.") and not k.startswith("clip.vision_model."):
-            k = "clip.vision_model." + k[len("clip."):]
+        if k.startswith("clip."):
+            rest = k[len("clip."):]
+            if rest.startswith("vision_model."):
+                rest = rest[len("vision_model."):]
+            k = "clip." + ("vision_model." if target_has_vm else "") + rest
         fixed[k] = v
     return fixed
 
@@ -247,7 +256,9 @@ class EditPipeline:
             "ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"]
         )
         if self.encoder_type in ("clip_arcface", "clip_arcface_split"):
-            image_encoder_state = _fix_clip_state_dict(image_encoder_state)
+            image_encoder_state = _fix_clip_state_dict(
+                image_encoder_state, self.image_encoder.state_dict()
+            )
         self.image_encoder.load_state_dict(image_encoder_state)
         self.image_encoder.eval()
 

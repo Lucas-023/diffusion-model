@@ -217,7 +217,9 @@ def generate(args):
         "ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"]
     )
     if encoder_type == "clip_arcface":
-        image_encoder_state = _fix_clip_state_dict(image_encoder_state)
+        image_encoder_state = _fix_clip_state_dict(
+            image_encoder_state, image_encoder.state_dict()
+        )
     image_encoder.load_state_dict(image_encoder_state)
     image_encoder.eval()
 
