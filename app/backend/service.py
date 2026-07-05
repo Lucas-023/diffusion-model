@@ -65,6 +65,9 @@ class _ProgressList:
     def __len__(self):
         return len(self.times)
 
+    def __getitem__(self, idx):
+        return self.times[idx]
+
     def __iter__(self):
         for t in self.times:
             yield t
