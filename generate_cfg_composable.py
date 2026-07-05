@@ -39,6 +39,7 @@ from models.modules import AttributeEmbedder
 from diffusion.conditional_ddpm import Diffusion_conditional
 from vae.modules import VAE
 from utils.utils_celeba import CelebALatentIdentityDataset
+from utils.edit_common import _fix_clip_state_dict
 
 
 # ============================================================
@@ -212,9 +213,12 @@ def generate(args):
     else:
         raise ValueError(f"encoder desconhecido no ckpt: {encoder_type}")
 
-    image_encoder.load_state_dict(
-        ckpt.get("ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"])
+    image_encoder_state = ckpt.get(
+        "ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"]
     )
+    if encoder_type == "clip_arcface":
+        image_encoder_state = _fix_clip_state_dict(image_encoder_state)
+    image_encoder.load_state_dict(image_encoder_state)
     image_encoder.eval()
 
     # ---------- ATTRIBUTE EMBEDDER ----------
