@@ -12,7 +12,9 @@ torchaudio==2.7.1
 # --- Encoders de condicionamento ---
 transformers>=4.40,<5      # CLIP ViT-L/14 (attribute_classifier) e ViT-B/32 (image cond.)
 insightface==0.7.3         # ArcFace (identidade) + face_align (alinhamento facial)
-onnxruntime-gpu>=1.17,<2   # backend de inferência do insightface (GPU)
+onnxruntime-gpu>=1.17,<1.20   # backend de inferência do insightface (GPU)
+                               # >=1.20 passou a exigir CUDA 13 (libcudart.so.13)
+                               # por padrão no PyPI; a VM tem driver CUDA 12.2
 
 # --- Métricas ---
 lpips>=0.1.4                # perceptual similarity
