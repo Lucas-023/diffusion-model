@@ -2,7 +2,7 @@
 app/backend/service.py
 ======================
 Camada de modelo do servidor: carrega UMA vez o EditPipeline
-(utils/edit_common.py), o FaceAligner e o CLIPAttributeClassifier, e expõe
+(utils/edit_common.py), os aligners e o CLIPAttributeClassifier, e expõe
 duas operações:
 
     classify(pil)   — atributos CelebA da foto (com probabilidades)
@@ -10,7 +10,7 @@ duas operações:
                       edit_sdedit.py / edit_ddim_inversion.py
 
 Diferenças em relação aos scripts CLI (que recarregam tudo a cada chamada):
-o classificador e o aligner ficam residentes, e o progresso é reportado no
+o classificador e os aligners ficam residentes, e o progresso é reportado no
 Job por meio de um wrapper de iterável passado a ddim_sample/ddim_invert
 (que iteram o que receberem via tqdm — nenhuma mudança em edit_common).
 
@@ -99,6 +99,7 @@ class ModelService:
         self.device = None
         self.pipe = None
         self.aligner = None
+        self.photo_aligner = None
         self.classifier = None
 
     # --------------------------------------------------------
@@ -143,8 +144,16 @@ class ModelService:
             noise_steps=self.settings.noise_steps,
         )
 
+        # FaceAligner (template ArcFace): usado só pelo classificador de
+        # atributos, treinado sobre esse recorte (val F1≈0.73). CelebAAligner
+        # (template nativo do CelebA): usado para preparar a foto que entra
+        # no VAE/ArcFaceEncoder/ImageConditionEncoder, que foram treinados
+        # sobre o crop nativo do CelebA — ver utils/edit_common.prepare_photo
+        # e data/correct_alignment.py.
         from data.face_align import FaceAligner
+        from data.correct_alignment import CelebAAligner
         self.aligner = FaceAligner()
+        self.photo_aligner = CelebAAligner()
 
         if self.settings.classifier_ckpt:
             from models.attribute_classifier import CLIPAttributeClassifier
@@ -223,7 +232,7 @@ class ModelService:
         torch.manual_seed(p["seed"])
 
         job.stage = "preparando foto"
-        img = prepare_photo(p["photo_path"], device, aligner=self.aligner)
+        img = prepare_photo(p["photo_path"], device, aligner=self.photo_aligner)
 
         # atributos originais: enviados pelo front, ou classificados aqui
         if p.get("orig_attrs") is not None:

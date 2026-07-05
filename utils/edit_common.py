@@ -19,9 +19,13 @@ Preprocessamento de fotos pessoais:
     Os latentes de treino vêm de imagens do CelebA alinhado (178x218,
     CenterCrop(178) → Resize(256)). Uma foto qualquer precisa reproduzir
     esse enquadramento, senão o latente fica fora da distribuição de
-    treino. prepare_photo() detecta os olhos (detector do insightface, já
-    dependência via FaceAligner) e aplica uma transformação de similaridade
-    que leva os olhos às posições médias do CelebA no frame 256x256.
+    treino. prepare_photo() usa o CelebAAligner (data/correct_alignment.py)
+    para alinhar a foto ao template NATIVO do CelebA (178x218, via ajuste
+    de similaridade nos 5 pontos), e então aplica a MESMA CELEBA_TRANSFORM
+    usada em imagens reais do dataset — em vez do template do ArcFace
+    (FaceAligner), que recorta olhos-nariz-boca de forma mais apertada e
+    produz um enquadramento diferente do que o VAE/ArcFaceEncoder/
+    ImageConditionEncoder foram treinados para ver.
 """
 
 import os
@@ -89,50 +93,20 @@ CELEBA_TRANSFORM = T.Compose([
     T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
 ])
 
-# Posições médias dos olhos no CelebA alinhado (178x218): ~(69,111) e
-# ~(108,111). Após CenterCrop(178) (top=20) e Resize(256) (escala 256/178):
-_EYES_DST_256 = np.float32([
-    [ 99.2, 130.9],   # olho esquerdo (da pessoa, lado esq. da imagem)
-    [155.3, 130.9],   # olho direito
-])
-
-
 # ============================================================
 # PREPROCESSAMENTO DA FOTO
 # ============================================================
-
-def _similarity_warp_from_eyes(img_rgb, eyes_src, eyes_dst, out_size=256):
-    """
-    Transformação de similaridade (rotação+escala+translação) definida por
-    2 pontos (os olhos), via aritmética complexa: o par de olhos de origem
-    é levado exatamente ao par de destino.
-    """
-    import cv2
-
-    p1, p2 = complex(*eyes_src[0]), complex(*eyes_src[1])
-    q1, q2 = complex(*eyes_dst[0]), complex(*eyes_dst[1])
-
-    m = (q2 - q1) / (p2 - p1)          # escala * rotação
-    t = q1 - m * p1                    # translação
-
-    M = np.float32([
-        [m.real, -m.imag, t.real],
-        [m.imag,  m.real, t.imag],
-    ])
-    return cv2.warpAffine(
-        img_rgb, M, (out_size, out_size),
-        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
-    )
-
 
 def prepare_photo(path, device, aligner=None):
     """
     Carrega uma foto e a leva ao enquadramento 256x256 do treino.
 
     - Imagem 178x218 (CelebA alinhado): usa a transform exata do treino.
-    - Qualquer outra: detecta os olhos e faz warp de similaridade para as
-      posições médias do CelebA; sem rosto detectado, cai em center-crop
-      quadrado + resize (com aviso — resultado pode degradar).
+    - Qualquer outra: CelebAAligner alinha ao template nativo do CelebA
+      (178x218, sem rosto detectado cai em center-crop respeitando a
+      proporção 178:218 — com aviso, enquadramento pode ficar fora da
+      distribuição de treino); em seguida aplica a mesma CELEBA_TRANSFORM
+      usada em imagens reais do dataset.
 
     Retorna tensor [1, 3, 256, 256] em [-1, 1].
     """
@@ -143,28 +117,18 @@ def prepare_photo(path, device, aligner=None):
         return CELEBA_TRANSFORM(img).unsqueeze(0).to(device)
 
     if aligner is None:
-        from data.face_align import FaceAligner
-        aligner = FaceAligner()
+        from data.correct_alignment import CelebAAligner
+        aligner = CelebAAligner()
 
-    img_rgb = np.array(img)
-    kps = aligner.detect_kps(img_rgb)
-
-    if kps is None:
+    aligned_pil, found = aligner.align_pil(img)
+    if not found:
         print(f"[foto] AVISO: nenhum rosto detectado em {path} — "
-              "center-crop quadrado como fallback (enquadramento pode "
+              "center-crop CelebA como fallback (enquadramento pode "
               "ficar fora da distribuição de treino).")
-        h, w = img_rgb.shape[:2]
-        s = min(h, w)
-        top, left = (h - s) // 2, (w - s) // 2
-        crop = Image.fromarray(img_rgb[top:top + s, left:left + s])
-        crop = crop.resize((256, 256), Image.BICUBIC)
-        out = np.array(crop)
     else:
-        print(f"[foto] {path}: rosto detectado — warp para enquadramento CelebA.")
-        out = _similarity_warp_from_eyes(img_rgb, kps[:2], _EYES_DST_256)
+        print(f"[foto] {path}: rosto detectado — alinhado ao template nativo do CelebA.")
 
-    tensor = torch.from_numpy(out).float().permute(2, 0, 1) / 127.5 - 1.0
-    return tensor.unsqueeze(0).to(device)
+    return CELEBA_TRANSFORM(aligned_pil).unsqueeze(0).to(device)
 
 
 # ============================================================
