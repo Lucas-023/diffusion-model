@@ -6,6 +6,9 @@
 
 # Apenas arquivos .py e notebooks sobem
 !*.py
+!*.tex
+!*.md
+!presentation/figures/*.png
 !*.ipynb
 
 # Permite frontend do webapp e suas dependências
