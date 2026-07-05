@@ -11,6 +11,9 @@
 !results/**/*.png
 !results/**/*.jpg
 !results/**/*.jpeg
+!report/**/*.tex
+!report/**/*.pdf
+!report/**/*.png
 
 # 4. BLOQUEIOS: O que NÃO PODE subir de jeito nenhum
 # Ignora pastas de dados/datasets (ajuste o nome se a sua pasta for diferente)
