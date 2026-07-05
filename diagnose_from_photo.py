@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageOps
 
 from utils.edit_common import CELEBA_TRANSFORM
 from models.encoders import ArcFaceEncoder
@@ -115,7 +115,9 @@ def check_celeba_consistency(fname, arcface, clip_model, aligner, device):
 
 
 def check_photo(photo_path, arcface, aligner, device, label="foto"):
-    img = Image.open(photo_path).convert("RGB")
+    # exif_transpose: aplica a rotação EXIF do celular (fotos em retrato
+    # são gravadas deitadas + flag de orientação).
+    img = ImageOps.exif_transpose(Image.open(photo_path)).convert("RGB")
     aligned, found = aligner.align_pil(img)
 
     frac = _black_border_frac(aligned)

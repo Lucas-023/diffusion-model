@@ -32,7 +32,7 @@ import os
 import numpy as np
 import torch
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageOps
 from tqdm import tqdm
 
 from models.unet_conditional import UNet_cond
@@ -110,7 +110,9 @@ def prepare_photo(path, device, aligner=None):
 
     Retorna tensor [1, 3, 256, 256] em [-1, 1].
     """
-    img = Image.open(path).convert("RGB")
+    # exif_transpose aplica a rotação gravada pelo celular no EXIF — sem
+    # isso, fotos tiradas em retrato chegam DEITADAS no aligner/encoders.
+    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
 
     if img.size == (178, 218):
         print(f"[foto] {path}: enquadramento CelebA — transform do treino.")
@@ -160,7 +162,8 @@ def resolve_original_attrs(args, photo_path, device):
     from models.attribute_classifier import CLIPAttributeClassifier
 
     aligner = FaceAligner()
-    aligned_pil, found = aligner.align_pil(Image.open(photo_path))
+    photo = ImageOps.exif_transpose(Image.open(photo_path))
+    aligned_pil, found = aligner.align_pil(photo)
     if not found:
         print("[attrs] AVISO: rosto não detectado para o classificador — "
               "usando fallback de center-crop (predição pode degradar).")
