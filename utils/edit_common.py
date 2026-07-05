@@ -39,6 +39,25 @@ from vae.modules import VAE
 
 
 # ============================================================
+# COMPATIBILIDADE DE CHECKPOINT
+# ============================================================
+
+def _fix_clip_state_dict(state):
+    """Checkpoints antigos foram salvos com uma versão do `transformers`
+    cujo CLIPVisionModel não tinha o submódulo `vision_model` (chaves
+    "clip.embeddings...", "clip.encoder...", "clip.post_layernorm...").
+    A versão atual sempre envolve a transformer em `self.vision_model`
+    ("clip.vision_model.embeddings...", etc). Remapeia as chaves antigas
+    para o layout atual, sem precisar fixar uma versão antiga do pacote."""
+    fixed = {}
+    for k, v in state.items():
+        if k.startswith("clip.") and not k.startswith("clip.vision_model."):
+            k = "clip.vision_model." + k[len("clip."):]
+        fixed[k] = v
+    return fixed
+
+
+# ============================================================
 # CELEBA
 # ============================================================
 
@@ -257,9 +276,12 @@ class EditPipeline:
         else:
             raise ValueError(f"encoder desconhecido no ckpt: {self.encoder_type}")
 
-        self.image_encoder.load_state_dict(
-            ckpt.get("ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"])
+        image_encoder_state = ckpt.get(
+            "ema_image_encoder_state_dict", ckpt["image_encoder_state_dict"]
         )
+        if self.encoder_type in ("clip_arcface", "clip_arcface_split"):
+            image_encoder_state = _fix_clip_state_dict(image_encoder_state)
+        self.image_encoder.load_state_dict(image_encoder_state)
         self.image_encoder.eval()
 
         self.attribute_embedder = AttributeEmbedder(
