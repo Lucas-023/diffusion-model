@@ -1,0 +1,535 @@
+% =========================================================
+% Relatório — Edição de Atributos Faciais com Preservação de
+% Identidade via CFG Composicional em Modelos de Difusão Latente
+%
+% Compilar com:  pdflatex relatorio_ldm_cfg.tex  (2x)
+% Formato: artigo em duas colunas, estilo paper de ML (arXiv-like)
+% =========================================================
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage{mathptmx}          % Times para texto e matemática
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[a4paper,margin=2cm,columnsep=0.7cm]{geometry}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
+\usepackage{enumitem}
+\setlist{leftmargin=*,itemsep=2pt,topsep=3pt}
+
+% ---------------------------------------------------------
+% Cabeçalho do paper
+% ---------------------------------------------------------
+\title{\LARGE\bfseries Edição de Atributos Faciais com Preservação de
+Identidade via Classifier-Free Guidance Composicional em Modelos de
+Difusão Latente}
+
+\author{Lucas\\[2pt]
+\normalsize\url{https://github.com/Lucas-023/diffusion-model}}
+
+\date{}
+
+\begin{document}
+
+\twocolumn[
+  \maketitle
+  \begin{center}
+  \begin{minipage}{0.85\textwidth}
+    \small
+    \begin{center}\textbf{Resumo}\end{center}
+    Este trabalho investiga a edição de atributos faciais com preservação
+    de identidade usando um Modelo de Difusão Latente (LDM) condicional
+    treinado no CelebA. Dada a foto de uma pessoa, o sistema extrai um
+    embedding de identidade (ArcFace), tokens de aparência (CLIP) e um
+    vetor de 40 atributos binários; o usuário edita os atributos desejados
+    e o modelo gera uma nova imagem que preserva a identidade original. A
+    hipótese inicial --- combinar Classifier-Free Guidance (CFG) para
+    identidade com Classifier Guidance (CG) para atributos (``Mixed
+    Guidance'') --- mostrou-se estruturalmente frágil: a saturação da
+    sigmoide no classificador multi-rótulo, a diluição do gradiente entre
+    os 40 atributos e a janela temporal estreita em que um classificador
+    sobre latentes ruidosos é informativo enfraquecem o sinal de edição.
+    Substituímos o CG por \textbf{CFG composicional}~\cite{liu2022}, tratando
+    identidade e atributos como condicionantes independentes com escalas de
+    guidance separadas ($s_{\mathrm{id}}$, $s_{\mathrm{attr}}$). Duas
+    contribuições adicionais foram necessárias na prática:
+    (i)~\textbf{pareamento de referência por identidade} --- condicionar o
+    treino em uma foto \emph{diferente} da mesma pessoa, impedindo que o
+    ramo CLIP vaze a expressão da imagem-alvo e anule o token de atributo;
+    e (ii)~um modo \textbf{split} com três ramos de guidance (ArcFace,
+    CLIP, atributos), que permite zerar a contribuição de aparência da
+    referência em edições estruturais (p.\,ex.\ \emph{Bald}) sem perder
+    identidade. A avaliação combina FID periódico com amostragem DDIM,
+    testes qualitativos de edição forçada (\emph{Smiling}=1) e um
+    classificador de atributos CLIP ViT-L/14 ajustado no CelebA
+    (F1\,$\approx$\,0{,}73) para verificação.
+
+    \vspace{4pt}
+    \textbf{Palavras-chave:} modelos de difusão latente, classifier-free
+    guidance, edição de atributos faciais, preservação de identidade,
+    CelebA, ArcFace.
+  \end{minipage}
+  \end{center}
+  \vspace{18pt}
+]
+
+% =========================================================
+\section{Introdução}
+% =========================================================
+
+Modelos de difusão tornaram-se o padrão para síntese de imagens de alta
+qualidade~\cite{ho2020,rombach2022}, e sua variante latente (LDM)
+\cite{rombach2022} reduz drasticamente o custo computacional ao operar no
+espaço comprimido de um autoencoder. Um problema em aberto de interesse
+prático é a \emph{edição condicional com preservação de identidade}: dada
+a foto de uma pessoa, gerar a mesma pessoa com um subconjunto de
+atributos faciais alterado --- fazê-la sorrir, adicionar óculos, remover
+cabelo --- sem alterar quem ela é.
+
+O pipeline proposto opera em cinco etapas: (1)~a imagem de entrada é
+codificada no espaço latente por um VAE; (2)~a identidade é representada
+por um embedding ArcFace~\cite{deng2019}; (3)~um classificador prediz os
+40 atributos binários do CelebA a partir da imagem; (4)~o usuário
+modifica um ou mais atributos preditos; (5)~o modelo de difusão gera a
+nova imagem condicionada ao embedding de identidade e ao vetor de
+atributos editado.
+
+A questão de pesquisa original era se a combinação de Classifier-Free
+Guidance~\cite{ho2022cfg} (para identidade) com Classifier
+Guidance~\cite{dhariwal2021} (para atributos) melhora a controlabilidade
+preservando identidade. Os experimentos revelaram três falhas estruturais
+do Classifier Guidance nesse cenário (Seção~\ref{sec:cg-falha}), o que
+motivou a migração para uma formulação inteiramente baseada em CFG
+composicional~\cite{liu2022}, na qual identidade e atributos são
+condicionantes independentes com escalas de guidance próprias. Este
+relatório documenta a arquitetura, o protocolo de treinamento e a
+sequência de experimentos que levou ao método final, implementado em
+\texttt{train/train\_cfg\_composable\_paired.py}.
+
+% =========================================================
+\section{Dados}
+% =========================================================
+
+Todos os experimentos usam o \textbf{CelebA}~\cite{liu2015}: 202.599
+fotos de rosto já alinhadas na convenção nativa do dataset, cada uma
+anotada com 40 atributos binários (\emph{Smiling}, \emph{Eyeglasses},
+\emph{Bald}, \ldots) e com um identificador de pessoa
+(\texttt{identity\_CelebA.txt}). As identidades têm em média ${\sim}20$
+fotos cada, e 91\% das identidades com pelo menos duas fotos variam no
+atributo \emph{Smiling} --- propriedade que fundamenta o pareamento de
+referência da Seção~\ref{sec:pareamento}.
+
+O pré-processamento segue uma convenção única em todo o pipeline:
+\texttt{CenterCrop(178)} seguido de \texttt{Resize(256)} sobre o recorte
+nativo do CelebA. Nenhum script de treino de difusão lê imagem crua; três
+caches pré-computados alimentam o treinamento:
+
+\begin{itemize}
+  \item \textbf{Cache de latentes} --- saída determinística do encoder do
+    VAE (média $\mu$, sem amostragem), escalada por $0{,}18215$, com
+    formato $[4, 32, 32]$ por imagem;
+  \item \textbf{Cache de encoder} --- embedding ArcFace $[512]$ e tokens
+    de patch do CLIP ViT-B/32 $[49, 768]$ por imagem, evitando rodar os
+    backbones congelados a cada época;
+  \item \textbf{Cache alinhado do classificador} --- recortes
+    $224{\times}224$ usados apenas pelo classificador de atributos
+    (Seção~\ref{sec:classificador}), com convenção de alinhamento
+    própria.
+\end{itemize}
+
+Para o classificador de atributos, o split treino/validação/teste é feito
+\emph{por identidade}, não por imagem, evitando que a mesma pessoa vaze
+entre conjuntos. O CelebA é fortemente desbalanceado em vários atributos
+(p.\,ex.\ \emph{Bald} tem ${\sim}2\%$ de positivos), o que motivou o uso
+de Asymmetric Loss~\cite{benbaruch2021} no treino do classificador.
+
+% =========================================================
+\section{Arquitetura}
+% =========================================================
+
+\subsection{Visão geral}
+
+O sistema é um LDM condicional com três componentes treináveis --- a
+U-Net de denoising, o projetor de condicionamento de imagem e o embedder
+de atributos --- sobre backbones congelados (VAE, ArcFace, CLIP). O
+contexto de condicionamento é uma sequência de tokens de dimensão 512,
+consumida pela U-Net via cross-attention; nenhuma modificação na U-Net é
+necessária para adicionar ou remover ramos de condicionamento, pois o
+cross-attention atende a todos os tokens concatenados. A
+Tabela~\ref{tab:componentes} resume os componentes.
+
+\begin{table*}[t]
+  \centering
+  \caption{Componentes do modelo. Parâmetros congelados não recebem
+  gradiente.}
+  \label{tab:componentes}
+  \small
+  \begin{tabular}{llrl}
+    \toprule
+    \textbf{Componente} & \textbf{Configuração} & \textbf{Parâmetros} & \textbf{Treinável} \\
+    \midrule
+    VAE                           & latente $4{\times}32{\times}32$, fator $0{,}18215$            & 2,5\,M  & não (pré-treinado) \\
+    U-Net condicional             & base 128, mults $(1,2,4)$, atenção em $16^2$ e $8^2$          & 87,7\,M & sim \\
+    ArcFace (buffalo\_l)          & ONNX, embedding $[512]$                                       & ---     & não \\
+    CLIP ViT-B/32                 & tokens de patch $[49, 768]$                                   & ${\sim}88$\,M & não \\
+    Projeções de condicionamento  & ArcFace $\to$ 16 tokens; CLIP $\to$ 16 tokens                 & 4,9\,M  & sim \\
+    Embedder de atributos         & 40 tokens aprendidos $+$ \texttt{Embedding(2, 512)}           & 21,5\,K & sim \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{U-Net de denoising}
+
+A U-Net opera no latente $4{\times}32{\times}32$ com canais base 128 e
+multiplicadores $(1, 2, 4)$, dois blocos residuais por nível e embedding
+temporal senoidal projetado por MLP. Nas resoluções $16{\times}16$ e
+$8{\times}8$ (e no gargalo), cada bloco recebe um
+\texttt{SpatialTransformer}: self-attention seguida de cross-attention
+sobre o contexto de tokens e uma feed-forward $4{\times}$, com projeções
+de saída inicializadas em zero para estabilidade no início do treino.
+
+\subsection{Condicionamento}
+
+Três fontes de condicionamento são projetadas para o mesmo espaço de
+contexto (dim.~512):
+
+\begin{itemize}
+  \item \textbf{Identidade (ArcFace).} O embedding L2-normalizado $[512]$
+    é projetado linearmente em 16 tokens de contexto. O backbone ArcFace
+    é totalmente congelado (ONNX).
+  \item \textbf{Aparência (CLIP).} Os 49 tokens de patch do CLIP ViT-B/32
+    (sem o token CLS) são reduzidos a 16 tokens por average pooling
+    adaptativo e projetados para dim.~512 --- estilo
+    IP-Adapter~\cite{ye2023}. Esse ramo captura cabelo, iluminação, pose
+    e fundo da referência.
+  \item \textbf{Atributos.} Cada um dos 40 atributos binários vira um
+    token: um vetor aprendido por atributo somado a um embedding do valor
+    binário (\texttt{nn.Embedding(2, 512)}), produzindo contexto
+    $[B, 512, 40]$.
+\end{itemize}
+
+O contexto final é a concatenação dos ramos na dimensão de tokens ---
+72 tokens no modo padrão (16 CLIP $+$ 16 ArcFace $+$ 40 atributos).
+
+\subsection{CFG composicional}
+\label{sec:cfg-composicional}
+
+Na inferência, a predição de ruído combina múltiplos forward passes da
+U-Net segundo a formulação composicional de Liu et~al.~\cite{liu2022}:
+\begin{equation}
+\label{eq:composable}
+\begin{split}
+\hat{\epsilon} = \; & \epsilon(\varnothing,\varnothing)
+  + s_{\mathrm{id}}\left[\epsilon(\mathrm{id},\varnothing)
+      - \epsilon(\varnothing,\varnothing)\right] \\
+  & + s_{\mathrm{attr}}\left[\epsilon(\mathrm{id},\mathrm{attr})
+      - \epsilon(\mathrm{id},\varnothing)\right]
+\end{split}
+\end{equation}
+
+A ordem dos termos importa: o termo de atributo usa
+$\epsilon(\mathrm{id},\varnothing)$ como baseline --- mede ``dada a
+identidade, quanto o atributo desloca a predição'' --- em vez de competir
+com o termo de identidade. As escalas $s_{\mathrm{id}}$ e
+$s_{\mathrm{attr}}$ são ajustáveis independentemente na inferência,
+recuperando o controle separado que a formulação Mixed Guidance oferecia
+via \texttt{cfg\_scale} e \texttt{cg\_scale}.
+
+No modo \textbf{split} (três ramos), ArcFace e CLIP deixam de ser
+fundidos em um único condicionante ``id'':
+\begin{equation}
+\label{eq:split}
+\hat{\epsilon} = \epsilon(\varnothing,\varnothing,\varnothing)
+  + s_{\mathrm{id}}\,\Delta_{\mathrm{id}}
+  + s_{\mathrm{clip}}\,\Delta_{\mathrm{clip}}
+  + s_{\mathrm{attr}}\,\Delta_{\mathrm{attr}}
+\end{equation}
+onde cada $\Delta$ é a diferença de predições encadeada (identidade
+primeiro, depois aparência, depois atributos). Zerar $s_{\mathrm{clip}}$
+remove inteiramente a aparência da referência mantendo identidade e
+controle de atributo --- essencial em edições estruturais como
+\emph{Bald}, nas quais o cabelo visível na referência conflita
+diretamente com o atributo desejado.
+
+% =========================================================
+\section{Treinamento}
+% =========================================================
+
+\subsection{Objetivo e difusão}
+
+O processo direto é um DDPM padrão~\cite{ho2020} com 1.000 passos e
+schedule linear de $\beta$ ($10^{-4}$ a $2{\cdot}10^{-2}$). O modelo é
+treinado com o objetivo simples de predição de ruído sobre latentes:
+\begin{equation}
+\label{eq:loss}
+\mathcal{L} = \mathbb{E}_{z_0,\,\epsilon,\,t}
+  \left\| \epsilon - \epsilon_\theta(z_t, t, c) \right\|^2
+\end{equation}
+com $t$ uniforme em $[1, 1000)$ e contexto $c$ montado como na
+Seção~\ref{sec:cfg-composicional}. O VAE permanece congelado durante todo
+o treino.
+
+\subsection{Pareamento de referência por identidade}
+\label{sec:pareamento}
+
+Um achado central do projeto: quando a imagem de referência do
+condicionamento é a \emph{mesma} foto que é alvo do denoising, o ramo
+CLIP enxerga a expressão exata que o modelo precisa reconstruir. O modelo
+aprende a copiar a expressão da referência e ignora o token de atributo
+--- na prática, nenhum valor de $s_{\mathrm{attr}}$ conseguia fazer os
+rostos sorrirem. A correção é amostrar a referência de uma foto
+\textbf{diferente da mesma identidade} sempre que a pessoa tem ${\geq}2$
+fotos, mantendo o vetor de atributos da loss vindo do alvo. Como 91\% das
+identidades elegíveis variam em \emph{Smiling}, a maioria dos batches
+contém pares com expressões distintas, forçando o modelo a ler a
+expressão do token de atributo e não da referência.
+
+\subsection{Dropout de condicionamento}
+\label{sec:dropout}
+
+Para que a fórmula composicional disponha de todas as marginais na
+inferência, o dropout de CFG é sorteado \emph{por amostra} (não por
+batch): 10\% zeram só a identidade, 10\% zeram só os atributos, 10\%
+zeram ambos e 70\% mantêm tudo. No modo split, cada um dos três ramos
+recebe um dropout Bernoulli independente de 10\%. Zerar um ramo significa
+anular seus tokens de contexto.
+
+\subsection{Otimização}
+
+A Tabela~\ref{tab:hiperparametros} resume os hiperparâmetros. Amostras
+qualitativas e FID usam sempre os pesos EMA. A amostragem de avaliação
+substitui os ${\sim}999$ passos ancestrais por DDIM~\cite{song2021} com
+50 passos determinísticos --- cada passo custa 3 forwards da U-Net no
+modo padrão (Eq.~\ref{eq:composable}) ou 4 no modo split
+(Eq.~\ref{eq:split}). O último salto do DDIM vai direto para a imagem
+limpa usando a predição de $x_0$ do último passo real, já que o modelo
+nunca é treinado em $t = 0$.
+
+\begin{table}[t]
+  \centering
+  \caption{Hiperparâmetros de treinamento
+  (\texttt{train\_cfg\_composable\_paired.py}).}
+  \label{tab:hiperparametros}
+  \small
+  \begin{tabular}{@{}p{0.42\linewidth}p{0.5\linewidth}@{}}
+    \toprule
+    \textbf{Hiperparâmetro} & \textbf{Valor} \\
+    \midrule
+    Otimizador          & AdamW, lr $3{\cdot}10^{-4}$, weight decay $10^{-4}$ \\
+    Schedule de LR      & warmup linear (10 épocas) $+$ cosine annealing até $10^{-6}$ \\
+    Batch / acumulação  & 64 por GPU, 4 passos de acumulação de gradiente \\
+    Precisão            & mista (AMP) com \texttt{GradScaler} \\
+    Paralelismo         & DDP multi-GPU (NCCL), \texttt{no\_sync} durante acumulação \\
+    EMA                 & decay $0{,}9999$ sobre U-Net, encoder e embedder \\
+    Dropout de CFG      & $10\%/10\%/10\%$ por amostra (Seção~\ref{sec:dropout}) \\
+    Escalas de validação & $s_{\mathrm{id}}{=}3{,}0$; $s_{\mathrm{attr}}{=}5{,}0$; $s_{\mathrm{clip}}{=}3{,}0$ (split) \\
+    Amostragem de avaliação & DDIM 50 passos, $\eta = 0$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Protocolo de FID}
+
+O FID~\cite{heusel2017} é calculado periodicamente durante o treino: as
+estatísticas do lado real usam o conjunto de validação inteiro (extraídas
+uma única vez e cacheadas em disco); o lado gerado usa 256 amostras
+produzidas pelo modelo EMA a cada avaliação. O cálculo só começa após uma
+época configurável (\texttt{-{}-fid\_start\_epoch}), pois nas primeiras
+épocas o modelo ainda gera rostos incoerentes e o FID não é informativo.
+
+% =========================================================
+\section{Resultados e Experimentos}
+% =========================================================
+
+\subsection{Por que o Classifier Guidance falhou}
+\label{sec:cg-falha}
+
+A formulação original (``Mixed Guidance'') usava CFG para identidade e CG
+para atributos, com um classificador
+(\texttt{NoisyLatentAttrClassifier}) treinado sobre latentes ruidosos
+$z_t$. Três problemas estruturais enfraqueceram o sinal de edição:
+
+\begin{enumerate}
+  \item \textbf{Saturação da sigmoide.} No classificador binário
+    multi-rótulo, quando a predição está confiante (p.\,ex.\
+    $\mathit{not\_smiling} \approx 1$) o gradiente de
+    $\log p(y \mid z_t)$ colapsa; aumentar a escala de guidance para
+    compensar gera artefatos antes de gerar o sorriso.
+  \item \textbf{Diluição entre 40 atributos.} O gradiente soma os 40
+    atributos --- os 39 não editados dominam e o sinal do atributo-alvo
+    se dilui.
+  \item \textbf{Janela temporal estreita.} Para $t$ alto o latente é
+    quase ruído puro e o classificador aprende o prior; para $t$ baixo
+    ele funciona, mas restam poucos passos para editar a imagem.
+\end{enumerate}
+
+Esses são precisamente os problemas que motivaram o
+CFG~\cite{ho2022cfg}: a diferença de predições de ruído não satura e
+escala de forma estável. A migração para CFG composicional eliminou o
+classificador auxiliar, seu otimizador e a loss BCE do treino de difusão.
+
+\subsection{Vazamento de expressão pelo CLIP}
+
+Com CFG composicional e encoder CLIP$+$ArcFace condicionado na própria
+imagem-alvo, o teste qualitativo padrão (forçar \emph{Smiling}=1 nas
+amostras de validação e comparar com os atributos originais) revelou que
+subir $s_{\mathrm{attr}}$ não fazia quase ninguém sorrir: o CLIP via a
+expressão do alvo e o modelo a copiava. O pareamento por identidade
+(Seção~\ref{sec:pareamento}) ataca a causa em vez do sintoma. Os
+checkpoints permanecem intercambiáveis entre as variantes com e sem
+pareamento, permitindo warm-start entre experimentos.
+
+\subsection{Modo split para edições estruturais}
+
+Mesmo com pareamento, o ramo CLIP ainda transporta aparência da
+referência (cabelo, acessórios) que conflita com edições estruturais como
+\emph{Bald}. O modo split (Eq.~\ref{eq:split}) separa ArcFace e CLIP em
+ramos de guidance independentes usando os \emph{mesmos pesos} do encoder
+conjunto --- na inferência, $s_{\mathrm{clip}} \to 0$ remove a aparência
+da referência preservando identidade (ArcFace) e obediência ao atributo,
+enquanto $s_{\mathrm{clip}}$ alto recupera reconstrução fiel de
+iluminação e fundo. O ajuste vira uma escolha por edição, sem retreinar.
+
+\subsection{Classificador de atributos}
+\label{sec:classificador}
+
+O classificador que fecha o pipeline (predizer os atributos da foto de
+entrada para o usuário editar) é um CLIP ViT-L/14 com fine-tuning parcial
+(últimos blocos $+$ head), treinado com Asymmetric
+Loss~\cite{benbaruch2021}, warmup$+$cosine, clipping de gradiente e EMA,
+sobre split por identidade. A variante com alinhamento pelo template
+ArcFace atinge \textbf{F1\,$\approx$\,0{,}73} na validação, com limiar
+por atributo calibrado para F1 ótimo; uma variante com o alinhamento
+nativo do CelebA (que preserva a região de cabelo/chapéu que o recorte
+ArcFace corta) está em comparação controlada.
+
+\subsection{Métricas quantitativas e qualitativas}
+
+A Tabela~\ref{tab:resultados} resume os resultados obtidos até o momento.
+A cada checkpoint são salvas duas grades de amostras com as mesmas
+identidades: uma com os atributos verdadeiros das referências e outra com
+\emph{Smiling} forçado a 1 --- o contraste entre as duas é o teste direto
+de que o modelo aprendeu a editar sem trocar a pessoa. O treinamento do
+modelo final (\texttt{train\_cfg\_composable\_paired.py}, encoder
+CLIP$+$ArcFace pareado) está em andamento; FID e taxa de acerto de
+atributo verificada pelo classificador da Seção~\ref{sec:classificador}
+serão consolidados ao término.
+
+\begin{table}[t]
+  \centering
+  \caption{Resumo dos resultados obtidos até o momento.}
+  \label{tab:resultados}
+  \small
+  \begin{tabular}{@{}p{0.5\linewidth}p{0.26\linewidth}r@{}}
+    \toprule
+    \textbf{Experimento} & \textbf{Métrica} & \textbf{Valor} \\
+    \midrule
+    DDPM incondicional $32{\times}32$ (baseline)      & FID                    & 3,35 \\
+    Classificador de atributos (ViT-L/14)             & F1 macro (val.)        & ${\approx}\,0{,}73$ \\
+    LDM CFG composicional pareado                     & FID (EMA, DDIM-50)     & em treino \\
+    Edição \emph{Smiling}=1 vs.\ original             & qualitativa            & grades $4{\times}4$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% =========================================================
+\section{Conclusão}
+% =========================================================
+
+Este projeto partiu da hipótese de que Classifier Guidance complementaria
+o Classifier-Free Guidance na edição de atributos faciais e chegou, por
+eliminação experimental, a uma conclusão diferente: para atributos
+binários multi-rótulo sobre latentes ruidosos, o CG é estruturalmente
+frágil, e o CFG composicional oferece o mesmo controle independente de
+escalas com um sinal estável e sem classificador auxiliar. Duas lições
+práticas se destacam. Primeiro, \emph{o que o encoder de condicionamento
+enxerga durante o treino define o que o modelo obedece na inferência}:
+condicionar na própria imagem-alvo ensina o modelo a ignorar o token de
+atributo, e o pareamento por identidade corrige isso na raiz. Segundo,
+separar os ramos de condicionamento (identidade pura vs.\ aparência) em
+termos de guidance independentes transforma um conflito de treino em um
+controle de inferência ajustável por edição.
+
+Trabalhos futuros incluem consolidar as métricas quantitativas do modelo
+pareado (FID e acurácia de atributo verificada pelo classificador),
+comparar formalmente os encoders (CLIP$+$ArcFace vs.\ ArcFace-only vs.\
+split) e explorar variantes arquiteturais já mapeadas --- dual
+cross-attention no estilo IP-Adapter~\cite{ye2023} e modulação
+adaLN/FiLM para atributos, que alcançaria todos os blocos da U-Net em vez
+de apenas as resoluções com atenção.
+
+% =========================================================
+% Referências
+% =========================================================
+\begin{thebibliography}{12}
+\small
+
+\bibitem{ho2020}
+J.~Ho, A.~Jain, P.~Abbeel.
+\newblock Denoising Diffusion Probabilistic Models.
+\newblock \emph{NeurIPS}, 2020.
+
+\bibitem{liu2022}
+N.~Liu, S.~Li, Y.~Du, A.~Torralba, J.~B. Tenenbaum.
+\newblock Compositional Visual Generation with Composable Diffusion Models.
+\newblock \emph{ECCV}, 2022.
+
+\bibitem{rombach2022}
+R.~Rombach, A.~Blattmann, D.~Lorenz, P.~Esser, B.~Ommer.
+\newblock High-Resolution Image Synthesis with Latent Diffusion Models.
+\newblock \emph{CVPR}, 2022.
+
+\bibitem{ho2022cfg}
+J.~Ho, T.~Salimans.
+\newblock Classifier-Free Diffusion Guidance.
+\newblock \emph{arXiv:2207.12598}, 2022.
+
+\bibitem{dhariwal2021}
+P.~Dhariwal, A.~Nichol.
+\newblock Diffusion Models Beat GANs on Image Synthesis.
+\newblock \emph{NeurIPS}, 2021.
+
+\bibitem{deng2019}
+J.~Deng, J.~Guo, N.~Xue, S.~Zafeiriou.
+\newblock ArcFace: Additive Angular Margin Loss for Deep Face Recognition.
+\newblock \emph{CVPR}, 2019.
+
+\bibitem{radford2021}
+A.~Radford et~al.
+\newblock Learning Transferable Visual Models From Natural Language
+  Supervision.
+\newblock \emph{ICML}, 2021.
+
+\bibitem{liu2015}
+Z.~Liu, P.~Luo, X.~Wang, X.~Tang.
+\newblock Deep Learning Face Attributes in the Wild.
+\newblock \emph{ICCV}, 2015.
+
+\bibitem{song2021}
+J.~Song, C.~Meng, S.~Ermon.
+\newblock Denoising Diffusion Implicit Models.
+\newblock \emph{ICLR}, 2021.
+
+\bibitem{benbaruch2021}
+E.~Ben-Baruch et~al.
+\newblock Asymmetric Loss for Multi-Label Classification.
+\newblock \emph{ICCV}, 2021.
+
+\bibitem{heusel2017}
+M.~Heusel et~al.
+\newblock GANs Trained by a Two Time-Scale Update Rule Converge to a Local
+  Nash Equilibrium.
+\newblock \emph{NeurIPS}, 2017.
+
+\bibitem{ye2023}
+H.~Ye, J.~Zhang, S.~Liu, X.~Han, W.~Yang.
+\newblock IP-Adapter: Text Compatible Image Prompt Adapter for
+  Text-to-Image Diffusion Models.
+\newblock \emph{arXiv:2308.06721}, 2023.
+
+\end{thebibliography}
+
+\end{document}
