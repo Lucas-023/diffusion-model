@@ -230,6 +230,99 @@ def sample_split_ddim(
 
 
 # ============================================================
+# COMPOSABLE CFG — DDPM ancestral, 2 ramos (id, attr)
+# ============================================================
+
+@torch.no_grad()
+def sample_composable_ddpm(
+    unet, diffusion, id_tokens, attr_tokens,
+    n, channels, device, s_id=3.0, s_attr=5.0,
+):
+    unet.eval()
+    img_size = diffusion.img_size
+    z_t = torch.randn(n, channels, img_size, img_size, device=device)
+
+    zeros_id, zeros_attr = torch.zeros_like(id_tokens), torch.zeros_like(attr_tokens)
+    ctx_uu = torch.cat([zeros_id,   zeros_attr], dim=2)
+    ctx_iu = torch.cat([id_tokens,  zeros_attr], dim=2)
+    ctx_ia = torch.cat([id_tokens,  attr_tokens], dim=2)
+
+    for t in tqdm(reversed(range(1, diffusion.noise_steps)),
+                  desc="Sampling (DDPM, id+attr)", total=diffusion.noise_steps - 1):
+
+        t_vec = torch.full((n,), t, device=device, dtype=torch.long)
+
+        alpha_hat_t = diffusion.alpha_hat[t_vec][:, None, None, None]
+        alpha_t     = diffusion.alpha[t_vec][:, None, None, None]
+        beta_t      = diffusion.beta[t_vec][:, None, None, None]
+
+        eps_uu = unet(z_t, t_vec, context=ctx_uu)
+        eps_iu = unet(z_t, t_vec, context=ctx_iu)
+        eps_ia = unet(z_t, t_vec, context=ctx_ia)
+        eps = eps_uu + s_id * (eps_iu - eps_uu) + s_attr * (eps_ia - eps_iu)
+
+        noise = torch.randn_like(z_t) if t > 1 else torch.zeros_like(z_t)
+        z_t = (
+            (1.0 / torch.sqrt(alpha_t))
+            * (z_t - (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t) * eps)
+        ) + torch.sqrt(beta_t) * noise
+
+    return z_t
+
+
+# ============================================================
+# COMPOSABLE CFG — DDPM ancestral, 3 ramos (id, clip, attr)
+# ============================================================
+
+@torch.no_grad()
+def sample_split_ddpm(
+    unet, diffusion, id_tokens, clip_tokens, attr_tokens,
+    n, channels, device, s_id=3.0, s_clip=3.0, s_attr=5.0,
+):
+    unet.eval()
+    img_size = diffusion.img_size
+    z_t = torch.randn(n, channels, img_size, img_size, device=device)
+
+    zeros_id   = torch.zeros_like(id_tokens)
+    zeros_clip = torch.zeros_like(clip_tokens)
+    zeros_attr = torch.zeros_like(attr_tokens)
+
+    ctx_000 = torch.cat([zeros_id,   zeros_clip,   zeros_attr], dim=2)
+    ctx_i00 = torch.cat([id_tokens,  zeros_clip,   zeros_attr], dim=2)
+    ctx_ic0 = torch.cat([id_tokens,  clip_tokens,  zeros_attr], dim=2)
+    ctx_ica = torch.cat([id_tokens,  clip_tokens,  attr_tokens], dim=2)
+
+    for t in tqdm(reversed(range(1, diffusion.noise_steps)),
+                  desc="Sampling (DDPM, id+clip+attr)", total=diffusion.noise_steps - 1):
+
+        t_vec = torch.full((n,), t, device=device, dtype=torch.long)
+
+        alpha_hat_t = diffusion.alpha_hat[t_vec][:, None, None, None]
+        alpha_t     = diffusion.alpha[t_vec][:, None, None, None]
+        beta_t      = diffusion.beta[t_vec][:, None, None, None]
+
+        eps_000 = unet(z_t, t_vec, context=ctx_000)
+        eps_i00 = unet(z_t, t_vec, context=ctx_i00)
+        eps_ic0 = unet(z_t, t_vec, context=ctx_ic0)
+        eps_ica = unet(z_t, t_vec, context=ctx_ica)
+
+        eps = (
+            eps_000
+            + s_id   * (eps_i00 - eps_000)
+            + s_clip * (eps_ic0 - eps_i00)
+            + s_attr * (eps_ica - eps_ic0)
+        )
+
+        noise = torch.randn_like(z_t) if t > 1 else torch.zeros_like(z_t)
+        z_t = (
+            (1.0 / torch.sqrt(alpha_t))
+            * (z_t - (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t) * eps)
+        ) + torch.sqrt(beta_t) * noise
+
+    return z_t
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -346,32 +439,56 @@ def generate(args):
 
             if encoder_type == "arcface_only":
                 id_tok = image_encoder(ref_img=ref_img, id_emb=id_emb)
-                latents = sample_composable_ddim(
-                    unet=unet, diffusion=diffusion,
-                    id_tokens=id_tok, attr_tokens=attr_tok,
-                    n=1, channels=4, device=device,
-                    s_id=args.s_id, s_attr=args.s_attr, ddim_steps=args.ddim_steps,
-                )
+                if args.sampler == "ddpm":
+                    latents = sample_composable_ddpm(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_attr=args.s_attr,
+                    )
+                else:
+                    latents = sample_composable_ddim(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_attr=args.s_attr, ddim_steps=args.ddim_steps,
+                    )
             elif encoder_type == "clip_arcface_split":
                 clip_tok, id_tok = image_encoder(
                     ref_img=ref_img, id_emb=id_emb, clip_tokens_raw=clip_raw,
                     return_separate=True,
                 )
-                latents = sample_split_ddim(
-                    unet=unet, diffusion=diffusion,
-                    id_tokens=id_tok, clip_tokens=clip_tok, attr_tokens=attr_tok,
-                    n=1, channels=4, device=device,
-                    s_id=args.s_id, s_clip=args.s_clip, s_attr=args.s_attr,
-                    ddim_steps=args.ddim_steps,
-                )
+                if args.sampler == "ddpm":
+                    latents = sample_split_ddpm(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, clip_tokens=clip_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_clip=args.s_clip, s_attr=args.s_attr,
+                    )
+                else:
+                    latents = sample_split_ddim(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, clip_tokens=clip_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_clip=args.s_clip, s_attr=args.s_attr,
+                        ddim_steps=args.ddim_steps,
+                    )
             else:  # clip_arcface
                 id_tok = image_encoder(ref_img=ref_img, id_emb=id_emb, clip_tokens_raw=clip_raw)
-                latents = sample_composable_ddim(
-                    unet=unet, diffusion=diffusion,
-                    id_tokens=id_tok, attr_tokens=attr_tok,
-                    n=1, channels=4, device=device,
-                    s_id=args.s_id, s_attr=args.s_attr, ddim_steps=args.ddim_steps,
-                )
+                if args.sampler == "ddpm":
+                    latents = sample_composable_ddpm(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_attr=args.s_attr,
+                    )
+                else:
+                    latents = sample_composable_ddim(
+                        unet=unet, diffusion=diffusion,
+                        id_tokens=id_tok, attr_tokens=attr_tok,
+                        n=1, channels=4, device=device,
+                        s_id=args.s_id, s_attr=args.s_attr, ddim_steps=args.ddim_steps,
+                    )
 
             gen = vae.decode(latents / 0.18215)
 
@@ -388,7 +505,7 @@ def generate(args):
 
     out_path = os.path.join(
         args.save_dir,
-        f"test_paired_seed{args.seed}_sid{args.s_id}_sattr{args.s_attr}.png",
+        f"test_paired_{args.sampler}_seed{args.seed}_sid{args.s_id}_sattr{args.s_attr}.png",
     )
     save_image(grid, out_path, nrow=3)
     print(f"\nSalvo em: {out_path}  (colunas: original | referência pareada | gerada)")
@@ -425,7 +542,14 @@ if __name__ == "__main__":
     parser.add_argument("--s_clip", type=float, default=3.0, help="Só usado com --encoder clip_arcface_split.")
     parser.add_argument("--s_attr", type=float, default=5.0)
 
-    parser.add_argument("--ddim_steps", type=int, default=50)
+    parser.add_argument(
+        "--sampler", type=str, default="ddim", choices=["ddim", "ddpm"],
+        help="ddim: amostrador determinístico com --ddim_steps passos (rápido, "
+             "usado nas avaliações de train_cfg_composable_paired.py). "
+             "ddpm: amostragem ancestral completa (noise_steps passos, mais "
+             "lenta, mesma família do treino em t contínuo).",
+    )
+    parser.add_argument("--ddim_steps", type=int, default=50, help="Só usado com --sampler ddim.")
     parser.add_argument("--noise_steps", type=int, default=1000)
 
     # fallbacks se o ckpt for antigo e não tiver essas chaves
