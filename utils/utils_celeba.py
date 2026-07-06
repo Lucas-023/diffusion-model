@@ -784,7 +784,7 @@ class CelebALatentImageCondPairedDataset(CelebALatentImageCondCachedDataset):
     Motivação: com ref == target, o CLIP vê a expressão exata que o modelo
     precisa gerar, então ele aprende a copiar a expressão da referência em vez
     de usar o token de atributo — nenhum valor de `s_attr` desfaz isso (ver
-    CFG_COMPOSABLE.md). Trocar a referência por outra foto da mesma pessoa
+    docs/CFG_COMPOSABLE.md). Trocar a referência por outra foto da mesma pessoa
     quebra esse atalho: `attrs` (usado na loss) continua vindo do ALVO, não
     da referência.
 

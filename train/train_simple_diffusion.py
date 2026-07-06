@@ -9,7 +9,7 @@ from copy import deepcopy
 from torch.cuda.amp import GradScaler, autocast 
 from torchvision.utils import make_grid 
 
-from board import Board
+from utils.board import Board
 from utils.utils_celeba import get_data, save_images, setup_logging
 from models.unet import UNet
 from diffusion.ddpm import Diffusion

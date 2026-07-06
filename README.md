@@ -19,7 +19,7 @@ pip install insightface onnxruntime-gpu
 
 ```bash
 # Gerar a mesma pessoa com atributos editados
-python generate_from_ref.py \
+python inference/generate_from_ref.py \
     --ref_image foto.jpg \
     --ckpt models/LDM_Identity_v1/ckpt.pt \
     --enable Smiling Eyeglasses \
@@ -34,7 +34,7 @@ torchrun --nproc_per_node=4 train/traind_cond_identity.py \
 
 ## Documentação completa
 
-Ver [DIFFUSION_IDENTIDADE.md](DIFFUSION_IDENTIDADE.md) para arquitetura detalhada, fluxos de dados e guia de uso completo.
+Ver [docs/CFG_COMPOSABLE.md](docs/CFG_COMPOSABLE.md) e [docs/MIXED_GUIDANCE.md](docs/MIXED_GUIDANCE.md) para arquitetura detalhada, fluxos de dados e guia de uso completo.
 
 ## Resultados
 

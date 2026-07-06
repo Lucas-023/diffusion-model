@@ -80,7 +80,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 from tqdm import tqdm
 
-from board import Board
+from utils.board import Board
 from data.correct_alignment import CelebAAligner
 from models.attribute_classifier import CLIPAttributeClassifier
 

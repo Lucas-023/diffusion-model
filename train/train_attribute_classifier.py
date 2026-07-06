@@ -57,7 +57,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
-from board import Board
+from utils.board import Board
 from data.face_align import FaceAligner
 from models.attribute_classifier import CLIPAttributeClassifier
 

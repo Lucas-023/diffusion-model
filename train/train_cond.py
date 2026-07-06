@@ -15,7 +15,7 @@ from copy import deepcopy
 
 from torchvision.utils import make_grid
 
-from board import Board
+from utils.board import Board
 
 from utils.utils_celeba import (
     get_data,
