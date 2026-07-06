@@ -54,11 +54,13 @@ import os
 import argparse
 
 import torch
-from torchvision.utils import save_image
+import torch.nn.functional as F
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from models.unet_conditional import UNet_cond
-from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder
+from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder, ArcFaceEncoder
 from models.modules import AttributeEmbedder
 from diffusion.conditional_ddpm import Diffusion_conditional
 from vae.modules import VAE
@@ -322,6 +324,17 @@ def sample_split_ddpm(
     return z_t
 
 
+@torch.no_grad()
+def arcface_cosine_similarity(arcface, img_a, img_b):
+    """
+    img_a, img_b: [1, 3, H, W] em [-1, 1]. Retorna similaridade de
+    cosseno entre os embeddings ArcFace (alinhamento de identidade).
+    """
+    emb_a = arcface(img_a)
+    emb_b = arcface(img_b)
+    return F.cosine_similarity(emb_a, emb_b).item()
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -411,7 +424,10 @@ def generate(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    orig_imgs, ref_imgs, gen_imgs = [], [], []
+    print("Carregando ArcFace (métrica de identidade)...")
+    arcface = ArcFaceEncoder()
+
+    orig_imgs, ref_imgs, gen_imgs, id_similarities = [], [], [], []
 
     for i, idx in enumerate(chosen):
         target_fname = dataset.samples[idx][0]
@@ -494,22 +510,38 @@ def generate(args):
 
             gen = vae.decode(latents / 0.18215)
 
+        id_sim = arcface_cosine_similarity(arcface, ref_img, gen)
+        id_similarities.append(id_sim)
+        print(f"  cos_sim(ArcFace) ref x gerada: {id_sim:.3f}")
+
         orig_imgs.append(((target_tensor.clamp(-1, 1) + 1) / 2).cpu())
         ref_imgs.append(((ref_cpu.clamp(-1, 1) + 1) / 2).cpu())
         gen_imgs.append(((gen.squeeze(0).clamp(-1, 1) + 1) / 2).cpu())
 
-    grid = []
-    for o, r, g in zip(orig_imgs, ref_imgs, gen_imgs):
-        grid.append(o)
-        grid.append(r)
-        grid.append(g)
-    grid = torch.stack(grid)
+    mean_sim = sum(id_similarities) / len(id_similarities)
+    print(f"\ncos_sim(ArcFace) médio ref x gerada: {mean_sim:.3f}")
+
+    fig, axes = plt.subplots(len(orig_imgs), 1, figsize=(6, 3.2 * len(orig_imgs)))
+    if len(orig_imgs) == 1:
+        axes = [axes]
+
+    for ax, o, r, g, sim in zip(axes, orig_imgs, ref_imgs, gen_imgs, id_similarities):
+        row = make_grid(torch.stack([o, r, g]), nrow=3, padding=2)
+        ax.imshow(row.permute(1, 2, 0).numpy())
+        ax.axis("off")
+        ax.text(
+            0.5, -0.06, f"cos_sim(ArcFace) ref x gerada = {sim:.3f}",
+            transform=ax.transAxes, ha="center", va="top", fontsize=10,
+        )
+
+    fig.tight_layout()
 
     out_path = os.path.join(
         args.save_dir,
         f"test_paired_{args.sampler}_seed{args.seed}_sid{args.s_id}_sattr{args.s_attr}.png",
     )
-    save_image(grid, out_path, nrow=3)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"\nSalvo em: {out_path}  (colunas: original | referência pareada | gerada)")
 
 
