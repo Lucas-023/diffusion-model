@@ -50,7 +50,11 @@ class CLIPAttributeClassifier(nn.Module):
         for p in self.clip.parameters():
             p.requires_grad = False
         if unfreeze_last_n > 0:
-            for layer in self.clip.vision_model.encoder.layers[-unfreeze_last_n:]:
+            # versões recentes do transformers achatam CLIPVisionModel (o
+            # transformer fica direto em .encoder), versões antigas o
+            # envolvem em .vision_model.encoder — aceita os dois layouts.
+            vision_model = getattr(self.clip, "vision_model", self.clip)
+            for layer in vision_model.encoder.layers[-unfreeze_last_n:]:
                 for p in layer.parameters():
                     p.requires_grad = True
 
