@@ -67,6 +67,7 @@ from diffusion.conditional_ddpm import Diffusion_conditional
 from models.unet_conditional import UNet_cond
 from models.encoders import ImageConditionEncoder, ArcFaceOnlyEncoder
 from models.modules import AttributeEmbedder
+from utils.edit_common import _fix_clip_state_dict
 from vae.modules import VAE
 
 from utils.fid import (
@@ -614,12 +615,25 @@ def train(args):
 
         ckpt = torch.load(args.resume_ckpt, map_location=device)
 
+        image_encoder_state     = ckpt["image_encoder_state_dict"]
+        ema_image_encoder_state = ckpt["ema_image_encoder_state_dict"]
+        if args.encoder in ("clip_arcface", "clip_arcface_split"):
+            # o checkpoint pode ter sido salvo com outra versão do
+            # transformers (layout com/sem "clip.vision_model.") do que
+            # a instalada agora — remapeia para o layout do modelo atual.
+            image_encoder_state = _fix_clip_state_dict(
+                image_encoder_state, image_encoder.module.state_dict()
+            )
+            ema_image_encoder_state = _fix_clip_state_dict(
+                ema_image_encoder_state, ema_image_encoder.state_dict()
+            )
+
         model.module.load_state_dict(ckpt["model_state_dict"])
-        image_encoder.module.load_state_dict(ckpt["image_encoder_state_dict"])
+        image_encoder.module.load_state_dict(image_encoder_state)
         attribute_embedder.module.load_state_dict(ckpt["attribute_embedder_state_dict"])
 
         ema_model.load_state_dict(ckpt["ema_state_dict"])
-        ema_image_encoder.load_state_dict(ckpt["ema_image_encoder_state_dict"])
+        ema_image_encoder.load_state_dict(ema_image_encoder_state)
         ema_attribute_embedder.load_state_dict(ckpt["ema_attribute_embedder_state_dict"])
 
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
